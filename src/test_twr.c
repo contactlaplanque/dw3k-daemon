@@ -286,19 +286,13 @@ static void filter_print_stats(const filter_t *f) {
  * Frame TX/RX
  *============================================================================*/
 
-/* Send frame and optionally enable RX immediately after */
+/* Send frame and optionally enable RX immediately after (software-controlled) */
 static bool send_frame(uint8_t *frame, size_t len, uint64_t *tx_ts, bool rx_after) {
     dwt_forcetrxoff();
     dwt_writetxdata((uint16_t)len, frame, 0);
     dwt_writetxfctrl((uint16_t)(len + 2), 0, 1);
 
-    /* Use TX_IMMEDIATE with optional RX_AFTER to minimize turnaround time */
-    int mode = DWT_START_TX_IMMEDIATE;
-    if (rx_after) {
-        mode |= DWT_RESPONSE_EXPECTED;  /* Auto-enable RX after TX */
-    }
-
-    if (dwt_starttx(mode) != DWT_SUCCESS) {
+    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
         return false;
     }
 
@@ -308,6 +302,9 @@ static bool send_frame(uint8_t *frame, size_t len, uint64_t *tx_ts, bool rx_afte
         if (status & DWT_INT_TXFRS_BIT_MASK) {
             dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
             if (tx_ts) *tx_ts = read_tx_timestamp();
+            if (rx_after) {
+                dwt_rxenable(DWT_START_RX_IMMEDIATE);
+            }
             return true;
         }
         usleep(1);
