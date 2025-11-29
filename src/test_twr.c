@@ -78,8 +78,8 @@
 #define RESULT_FRAME_LEN    18U   /* Poll + distance(4) + status(1) + count(1) + reserved(2) */
 
 /* Timing */
-#define RX_TIMEOUT_UUS          15000U  /* RX timeout (μs) */
-#define TX_TO_TX_DELAY_US       2000U   /* Delay between consecutive TX (μs) */
+#define RX_TIMEOUT_UUS          20000U  /* RX timeout (μs) */
+#define TX_TO_TX_DELAY_US       3000U   /* Delay between Final and Report (μs) */
 #define RANGING_INTERVAL_MS     500U    /* Time between ranging exchanges */
 
 /* Physics */
@@ -501,9 +501,9 @@ static void run_responder(void) {
         }
         printf("  T6=0x%010" PRIX64 "\n", t6);
 
-        /* [4] Wait for REPORT - re-enable RX with longer timeout */
+        /* [4] Wait for REPORT - quickly re-enable RX */
         dwt_forcetrxoff();
-        dwt_setrxtimeout((uint32_t)(RX_TIMEOUT_UUS * 3));
+        dwt_setrxtimeout((uint32_t)(RX_TIMEOUT_UUS * 2));
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
         if (!wait_for_frame(MSG_TYPE_REPORT, NULL)) {
             printf("  [FAIL] Report timeout\n\n");
