@@ -16,7 +16,7 @@
 int chip_init(void) {
     printf("=== DW3000 Initialization ===\n");
 
-    // 1. Start SPI at low speed (4 MHz required during initialization)
+    // 1. Start SPI at low speed (4 MHz required during initialization and reset)
     if (spi_init("/dev/spidev0.0", 4000000) != 0) {
         fprintf(stderr, "ERROR: SPI initialization failed\n");
         return -1;
@@ -28,7 +28,15 @@ int chip_init(void) {
         return -1;
     }
 
-    // 2. Wait for chip ready (IDLERC state)
+    // 2. Perform soft reset to ensure clean state
+    //    This is critical when restarting without power cycling.
+    //    The chip may be stuck in RX or other states from a previous run.
+    //    Note: SPI must be <= 7 MHz during reset (we're at 4 MHz).
+    printf("Performing soft reset...\n");
+    dwt_softreset(0);  // 0 = don't reset semaphore (not used on DW3000)
+    usleep(1000);      // Brief delay after reset
+
+    // 3. Wait for chip ready (IDLERC state)
     printf("Waiting for chip ready...\n");
     int wait = 0;
     while (!dwt_checkidlerc() && wait++ < 100) {
