@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include "spi_driver.h"  // For spi_init, spi_close declarations
 #include "deca_device_api.h"  // For chip_init declaration
 
