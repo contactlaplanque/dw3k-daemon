@@ -61,6 +61,7 @@
 #define MAX_WAIT_RETRIES        2U
 #define FAST_RANGING_INTERVAL_US 80000U  /* 80ms between measurements - safe for reliability */
 #define RESPONDER_IDLE_TIMEOUT_UUS 15000000U  /* 15s timeout after polling starts */
+#define DEFAULT_WAIT_TIMEOUT_US (RX_TIMEOUT_UUS * 3U)  /* ~90ms */
 
 /* Physics */
 #define SPEED_OF_LIGHT_M_S  299702547.0
@@ -234,11 +235,10 @@ static bool send_frame(uint8_t *frame, size_t len, uint64_t *tx_ts, bool rx_afte
     return false;
 }
 
-static bool wait_for_frame(uint8_t expected_type, uint64_t *rx_ts, uint8_t *received_type) {
-    uint32_t timeout = RX_TIMEOUT_UUS * 3;
+static bool wait_for_frame(uint8_t expected_type, uint64_t *rx_ts, uint8_t *received_type, uint32_t timeout_us) {
     uint32_t elapsed = 0;
 
-    while (elapsed < timeout) {
+    while (timeout_us == 0 || elapsed < timeout_us) {
         uint32_t status = dwt_readsysstatuslo();
 
         if (status & DWT_INT_RXFCG_BIT_MASK) {
@@ -332,7 +332,7 @@ static int run_initiator(uint32_t num_measurements) {
                     fail_reason = "Poll TX failed";
                     continue;
                 }
-                if (wait_for_frame(MSG_TYPE_RESPONSE, &t4, NULL)) {
+                if (wait_for_frame(MSG_TYPE_RESPONSE, &t4, NULL, DEFAULT_WAIT_TIMEOUT_US)) {
                     response_ok = true;
                     break;
                 }
@@ -372,7 +372,7 @@ static int run_initiator(uint32_t num_measurements) {
                     fail_reason = "Report TX failed";
                     continue;
                 }
-                if (wait_for_frame(MSG_TYPE_RESULT, NULL, NULL)) {
+                if (wait_for_frame(MSG_TYPE_RESULT, NULL, NULL, DEFAULT_WAIT_TIMEOUT_US)) {
                     result_ok = true;
                     break;
                 }
@@ -458,7 +458,9 @@ static int run_responder(void) {
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
         uint8_t frame_type = 0;
-        if (!wait_for_frame(first_poll_received ? MSG_TYPE_ANY : MSG_TYPE_POLL, &t2, &frame_type)) {
+        uint32_t poll_timeout = first_poll_received ? RESPONDER_IDLE_TIMEOUT_UUS : 0;
+        if (!wait_for_frame(first_poll_received ? MSG_TYPE_ANY : MSG_TYPE_POLL,
+                            &t2, &frame_type, poll_timeout)) {
             /* Timeout after first poll means initiator is done */
             if (first_poll_received) {
                 printf("Measurement complete. Total polls: %u\n", poll_count);
@@ -503,7 +505,7 @@ static int run_responder(void) {
         /* [3] Wait for FINAL with retries */
         bool final_ok = false;
         for (uint32_t attempt = 0; attempt < MAX_WAIT_RETRIES; ++attempt) {
-            if (wait_for_frame(MSG_TYPE_FINAL, &t6, NULL)) {
+            if (wait_for_frame(MSG_TYPE_FINAL, &t6, NULL, DEFAULT_WAIT_TIMEOUT_US)) {
                 final_ok = true;
                 break;
             }
@@ -520,7 +522,7 @@ static int run_responder(void) {
         
         bool report_ok = false;
         for (uint32_t attempt = 0; attempt < MAX_WAIT_RETRIES; ++attempt) {
-            if (wait_for_frame(MSG_TYPE_REPORT, NULL, NULL)) {
+            if (wait_for_frame(MSG_TYPE_REPORT, NULL, NULL, DEFAULT_WAIT_TIMEOUT_US)) {
                 report_ok = true;
                 break;
             }
