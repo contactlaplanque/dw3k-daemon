@@ -54,14 +54,14 @@
 #define RESULT_FRAME_LEN    18U
 #define STOP_FRAME_LEN      10U
 
-/* Timing - optimized for speed while maintaining reliability */
-#define RX_TIMEOUT_UUS          20000U  /* 20ms RX timeout (was 30ms) */
-#define TX_TO_TX_DELAY_US       2000U   /* 2ms delay between Final and Report (was 3ms) */
+/* Timing - optimized for speed while maintaining measurement accuracy */
+#define RX_TIMEOUT_UUS          20000U  /* 20ms RX timeout */
+#define TX_TO_TX_DELAY_US       3000U   /* 3ms delay between Final and Report - critical for accuracy */
 #define MAX_STAGE_RETRIES       2U
 #define MAX_WAIT_RETRIES        2U
 #define FAST_RANGING_INTERVAL_US 30000U  /* 30ms between measurements - balanced speed/reliability */
 #define RESPONDER_IDLE_TIMEOUT_UUS 15000000U  /* 15s timeout after polling starts */
-#define DEFAULT_WAIT_TIMEOUT_US (RX_TIMEOUT_UUS * 2U)  /* ~40ms (was 90ms) */
+#define DEFAULT_WAIT_TIMEOUT_US (RX_TIMEOUT_UUS * 2U)  /* ~40ms */
 
 /* Physics */
 #define SPEED_OF_LIGHT_M_S  299702547.0
