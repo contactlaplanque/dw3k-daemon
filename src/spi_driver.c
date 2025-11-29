@@ -10,6 +10,11 @@
 static int spi_fd = -1;
 
 int spi_init(const char *device, unsigned int speed_hz) {
+    if (spi_fd >= 0) {
+        close(spi_fd);
+        spi_fd = -1;
+    }
+
     spi_fd = open(device, O_RDWR);
     if (spi_fd < 0) {
         perror("Failed to open SPI device");

@@ -5,7 +5,8 @@
 /* Qorvo API header - found via -Idwt_uwb_driver */
 #include "deca_device_api.h"
 
-/* Your SPI driver header - found via -Iinclude */
+/* Platform glue */
+#include "qorvo_wrapper.h"
 #include "spi_driver.h"
 
 /* Optional: If your API version requires dwt_context_t */
@@ -22,6 +23,11 @@ int chip_init(void) {
     }
     printf("[SPI] Initialized at 4 MHz\n");
 
+    if (dw3k_driver_setup("/dev/spidev0.0") != 0) {
+        fprintf(stderr, "ERROR: DW3K driver probe failed\n");
+        return -1;
+    }
+
     // 2. Wait for chip ready (IDLERC state)
     printf("Waiting for chip ready...\n");
     int wait = 0;
@@ -34,20 +40,7 @@ int chip_init(void) {
     }
     printf("Chip is ready\n");
 
-    // 3. Probe device (REQUIRED in newer API versions, optional in older)
-    // If you get "dwt_probe undefined" error, your API version may not need it
-    // Comment out this section if it causes compilation errors
-    #ifdef DWT_PROBE_AVAILABLE
-    printf("Probing device...\n");
-    int ret = dwt_probe(&dw3000_probe_interf);
-    if (ret < 0) {
-        fprintf(stderr, "ERROR: dwt_probe() failed: %d\n", ret);
-        return -1;
-    }
-    printf("Device probed\n");
-    #endif
-
-    // 4. Initialize the device (loads calibration from OTP)
+    // 3. Initialize the device (loads calibration from OTP)
     printf("Initializing device...\n");
     int ret = dwt_initialise(DWT_READ_OTP_PID | DWT_READ_OTP_LID |
                              DWT_READ_OTP_BAT | DWT_READ_OTP_TMP);
@@ -57,7 +50,7 @@ int chip_init(void) {
     }
     printf("Device initialized\n");
 
-    // 5. Check device ID
+    // 4. Check device ID
     uint32_t dev_id = dwt_readdevid();
     printf("Device ID: 0x%08X\n", dev_id);
 
@@ -67,7 +60,7 @@ int chip_init(void) {
     }
     printf("Device ID verified\n");
 
-    // 6. Configure for operation
+    // 5. Configure for operation
     printf("Configuring device...\n");
     dwt_config_t config = {
         .chan = 5,                  // Channel 5
@@ -91,12 +84,12 @@ int chip_init(void) {
     }
     printf("Device configured\n");
 
-    // 7. Set addresses
+    // 6. Set addresses
     dwt_setpanid(0xDECA);
     dwt_setaddress16(0x1000);  // Our address
     printf("Addresses set (PAN: 0xDECA, Addr: 0x1000)\n");
 
-    // 8. Switch to fast SPI speed (20 MHz after initialization)
+    // 7. Switch to fast SPI speed (20 MHz after initialization)
     if (spi_init("/dev/spidev0.0", 20000000) != 0) {
         fprintf(stderr, "WARNING: Failed to switch to fast SPI speed\n");
         // Don't fail here, continue with 4 MHz
