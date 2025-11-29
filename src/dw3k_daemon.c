@@ -176,15 +176,6 @@ static int create_server_socket(const char *path) {
 }
 
 static int accept_client(int server_fd) {
-#if defined(__linux__) && defined(SOCK_CLOEXEC)
-    int fd = accept4(server_fd, NULL, NULL, SOCK_CLOEXEC);
-    if (fd >= 0) {
-        return fd;
-    }
-    if (errno != ENOSYS && errno != EINVAL) {
-        return -1;
-    }
-#endif
     int fd = accept(server_fd, NULL, NULL);
     if (fd < 0) {
         return fd;
