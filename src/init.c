@@ -13,6 +13,20 @@
 /* Uncomment if you get compilation errors about missing dwt_context */
 /* dwt_context_t dwt_context; */
 
+static dwt_sts_cp_key_t g_sts_key = {
+    .key0 = 0xC9A375FA,
+    .key1 = 0x8DF43A20,
+    .key2 = 0xB5E5A4ED,
+    .key3 = 0x0738123B,
+};
+
+static dwt_sts_cp_iv_t g_sts_iv = {
+    .iv0 = 0x00000001,
+    .iv1 = 0x00000000,
+    .iv2 = 0x00000000,
+    .iv3 = 0x00000000,
+};
+
 int chip_init(void) {
     printf("=== DW3000 Initialization ===\n");
 
@@ -58,6 +72,11 @@ int chip_init(void) {
     }
     printf("Device initialized\n");
 
+    /* Configure STS (Scrambled Timestamp Sequence) for improved robustness */
+    dwt_configurestskey(&g_sts_key);
+    dwt_configurestsiv(&g_sts_iv);
+    dwt_configurestsloadiv();
+
     // 4. Check device ID
     uint32_t dev_id = dwt_readdevid();
     printf("Device ID: 0x%08X\n", dev_id);
@@ -71,18 +90,18 @@ int chip_init(void) {
     // 5. Configure for operation
     printf("Configuring device...\n");
     dwt_config_t config = {
-        .chan = 5,                  // Channel 5
-        .txPreambLength = DWT_PLEN_128,
-        .rxPAC = DWT_PAC8,
+        .chan = 5,                      // Channel 5
+        .txPreambLength = DWT_PLEN_256, // Longer preamble for better SNR
+        .rxPAC = DWT_PAC16,
         .txCode = 4,
         .rxCode = 4,
-        .sfdType = 0,
+        .sfdType = DWT_SFD_IEEE_4A,
         .dataRate = DWT_BR_6M8,
         .phrMode = DWT_PHRMODE_STD,
         .phrRate = DWT_PHRRATE_STD,
-        .sfdTO = (128 + 1 + 8 - 8),
-        .stsMode = DWT_STS_MODE_OFF,
-        .stsLength = 0,
+        .sfdTO = (uint16_t)(256 + 1 + DWT_SFD_LEN8 - 8),
+        .stsMode = DWT_STS_MODE_1,
+        .stsLength = DWT_STS_LEN_64,
         .pdoaMode = DWT_PDOA_M0,
     };
 

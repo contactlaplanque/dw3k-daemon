@@ -44,6 +44,11 @@
 /* Message types */
 #define MSG_TYPE_POLL       0x21U
 #define MSG_TYPE_RESPONSE   0x10U
+#define MSG_TYPE_FINAL      0x23U
+#define MSG_TYPE_RESULT     0x42U
+#define RESULT_STATUS_OK        0x00U
+#define RESULT_STATUS_OUTLIER   0x01U
+#define RESULT_STATUS_ERROR     0xFFU
 
 /* Frame offsets */
 #define FRAME_FC_OFFSET     0U
@@ -57,10 +62,14 @@
 /* Frame sizes (excluding FCS which is auto-appended) */
 #define POLL_FRAME_LEN      10U   /* FC(2) + Seq(1) + PAN(2) + Dest(2) + Src(2) + Type(1) */
 #define RESPONSE_FRAME_LEN  20U   /* Poll frame + T2(5) + T3(5) */
+#define FINAL_FRAME_LEN     25U   /* Poll frame + T1(5) + T4(5) + T5(5) */
+#define RESULT_FRAME_LEN    18U   /* Poll frame + result payload */
 
 /* Timing */
 #define RESP_RX_TIMEOUT_UUS         10000U  /* Response RX timeout (μs) - added to reply delay */
 #define REPLY_DELAY_UUS             3000U   /* Responder reply delay (μs) - must match responder */
+#define FINAL_DELAY_UUS             4000U   /* Initiator final TX delay (μs) */
+#define RESULT_RX_TIMEOUT_UUS       15000U  /* Initiator wait for result (μs) */
 #define RANGING_INTERVAL_MS         500U    /* Time between ranging exchanges */
 
 /* Speed of light and time unit conversion */
@@ -72,6 +81,11 @@
 
 /* Statistics */
 #define STATS_WINDOW_SIZE   20U
+
+/* Filtering */
+#define FILTER_WINDOW_SIZE      16U
+#define FILTER_WARMUP_COUNT      4U
+#define OUTLIER_THRESHOLD_M    0.50
 
 /* RX buffer */
 #define RX_BUFFER_LEN       128U
@@ -86,12 +100,24 @@ typedef enum {
     ROLE_CALIBRATE
 } role_t;
 
+typedef enum {
+    PROTO_SS,
+    PROTO_DS
+} protocol_t;
+
 typedef struct {
     double samples[STATS_WINDOW_SIZE];
     size_t count;
     size_t index;
     double sum;
 } stats_t;
+
+typedef struct {
+    double samples[FILTER_WINDOW_SIZE];
+    size_t count;
+    size_t index;
+    double sum;
+} avg_filter_t;
 
 /*============================================================================
  * Global State
@@ -103,6 +129,7 @@ static uint8_t g_seq_num = 0;
 static stats_t g_stats = { 0 };
 static uint16_t g_ant_dly = DEFAULT_ANT_DLY;
 static double g_calibration_distance = 0.0;
+static protocol_t g_protocol = PROTO_SS;
 
 /* Frame templates */
 static uint8_t g_poll_frame[POLL_FRAME_LEN] = {
@@ -125,6 +152,31 @@ static uint8_t g_response_frame[RESPONSE_FRAME_LEN] = {
     0, 0, 0, 0, 0           /* T3 placeholder (5 bytes) - response TX timestamp */
 };
 
+static uint8_t g_final_frame[FINAL_FRAME_LEN] = {
+    0x41, 0x88,             /* Frame Control */
+    0x00,                   /* Sequence number */
+    (PAN_ID & 0xFF), (PAN_ID >> 8),
+    (RESPONDER_ADDR & 0xFF), (RESPONDER_ADDR >> 8),  /* Destination (responder) */
+    (INITIATOR_ADDR & 0xFF), (INITIATOR_ADDR >> 8),  /* Source (initiator) */
+    MSG_TYPE_FINAL,         /* Message type */
+    0, 0, 0, 0, 0,          /* T1 placeholder */
+    0, 0, 0, 0, 0,          /* T4 placeholder */
+    0, 0, 0, 0, 0           /* T5 placeholder */
+};
+
+static uint8_t g_result_frame[RESULT_FRAME_LEN] = {
+    0x41, 0x88,             /* Frame Control */
+    0x00,                   /* Sequence number */
+    (PAN_ID & 0xFF), (PAN_ID >> 8),
+    (INITIATOR_ADDR & 0xFF), (INITIATOR_ADDR >> 8),  /* Destination (initiator) */
+    (RESPONDER_ADDR & 0xFF), (RESPONDER_ADDR >> 8),  /* Source (responder) */
+    MSG_TYPE_RESULT,        /* Message type */
+    0, 0, 0, 0,             /* Distance (mm, little-endian) */
+    RESULT_STATUS_ERROR,    /* Status */
+    0,                      /* Sample count */
+    0, 0                    /* Reserved */
+};
+
 /*============================================================================
  * Forward Declarations
  *============================================================================*/
@@ -134,7 +186,11 @@ static void print_usage(const char *prog);
 static role_t parse_args(int argc, char **argv);
 static void configure_for_role(role_t role);
 
+static void run_initiator_ss(void);
+static void run_initiator_ds(void);
 static void run_initiator(void);
+static void run_responder_ss(void);
+static void run_responder_ds(void);
 static void run_responder(void);
 static void run_calibration(void);
 
@@ -145,11 +201,19 @@ static void timestamp_to_bytes(uint64_t ts, uint8_t *bytes);
 static uint64_t bytes_to_timestamp(const uint8_t *bytes);
 static uint64_t read_tx_timestamp(void);
 static uint64_t read_rx_timestamp(void);
+static void int32_to_bytes(int32_t value, uint8_t *bytes);
+static int32_t bytes_to_int32(const uint8_t *bytes);
 
 static double calculate_distance(int64_t ra, int64_t db);
 static void stats_add(stats_t *s, double value);
 static void stats_print(const stats_t *s);
 
+static void filter_reset(avg_filter_t *f);
+static void filter_add(avg_filter_t *f, double sample);
+static double filter_mean(const avg_filter_t *f);
+static size_t filter_effective_count(const avg_filter_t *f);
+static bool filter_is_ready(const avg_filter_t *f);
+static bool filter_is_outlier(const avg_filter_t *f, double sample, double threshold);
 /*============================================================================
  * Main
  *============================================================================*/
@@ -242,10 +306,26 @@ static role_t parse_args(int argc, char **argv) {
         exit(1);
     }
 
+    int opt_index = (role == ROLE_CALIBRATE) ? 3 : 2;
+
     /* Parse optional arguments */
-    for (int i = 2; i < argc; i++) {
+    for (int i = opt_index; i < argc; i++) {
         if (strcmp(argv[i], "--antdly") == 0 && i + 1 < argc) {
             g_ant_dly = (uint16_t)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--protocol") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (strcmp(mode, "ds") == 0 || strcmp(mode, "DS") == 0) {
+                g_protocol = PROTO_DS;
+            } else if (strcmp(mode, "ss") == 0 || strcmp(mode, "SS") == 0) {
+                g_protocol = PROTO_SS;
+            } else {
+                fprintf(stderr, "ERROR: unknown protocol '%s' (use 'ss' or 'ds')\n", mode);
+                exit(1);
+            }
+        } else if (strcmp(argv[i], "--ds") == 0) {
+            g_protocol = PROTO_DS;
+        } else if (strcmp(argv[i], "--ss") == 0) {
+            g_protocol = PROTO_SS;
         }
     }
 
@@ -268,12 +348,14 @@ static void configure_for_role(role_t role) {
 
     const char *role_str = (role == ROLE_RESPONDER) ? "Responder" :
                            (role == ROLE_CALIBRATE) ? "Calibration (Initiator)" : "Initiator";
+    const char *proto_str = (g_protocol == PROTO_DS) ? "Double-Sided" : "Single-Sided";
     
     printf("Role: %s\n", role_str);
     printf("Local address: 0x%04X\n", local_addr);
     printf("PAN ID: 0x%04X\n", PAN_ID);
     printf("Antenna delay: %u DWT units (%.2f ns)\n", 
            g_ant_dly, g_ant_dly * DWT_TIME_UNITS * 1e9);
+    printf("Protocol: %s TWR\n", proto_str);
     
     if (role == ROLE_CALIBRATE) {
         printf("Calibration distance: %.3f m\n", g_calibration_distance);
@@ -286,11 +368,22 @@ static void configure_for_role(role_t role) {
  *============================================================================*/
 
 static void run_initiator(void) {
+    if (g_protocol == PROTO_DS) {
+        run_initiator_ds();
+    } else {
+        run_initiator_ss();
+    }
+}
+
+static void run_initiator_ss(void) {
     printf("Starting ranging as initiator. Press Ctrl+C to stop.\n\n");
     
+    memset(&g_stats, 0, sizeof(g_stats));
     uint32_t exchange_count = 0;
     uint32_t success_count = 0;
     uint32_t fail_count = 0;
+    avg_filter_t filter;
+    filter_reset(&filter);
 
     while (g_running) {
         exchange_count++;
@@ -343,13 +436,27 @@ static void run_initiator(void) {
         double tof_dtu = (double)(ra - db) / 2.0;
         printf("  ToF              : %.0f DWT (%.3f ns)\n", tof_dtu, tof_dtu * DWT_TIME_UNITS * 1e9);
         
-        if (distance >= 0 && distance < 100.0) {
-            printf("\n  >>> DISTANCE: %.3f m <<<\n", distance);
-            stats_add(&g_stats, distance);
-            success_count++;
-            
-            if (g_stats.count >= 2) {
-                stats_print(&g_stats);
+        bool distance_valid = (distance >= 0.0 && distance < 100.0);
+        if (distance_valid) {
+            bool outlier = filter_is_outlier(&filter, distance, OUTLIER_THRESHOLD_M);
+            if (outlier) {
+                printf("\n  [SKIP] Outlier rejected (%.3f m exceeds %.2f m window)\n",
+                       distance, OUTLIER_THRESHOLD_M);
+                fail_count++;
+            } else {
+                filter_add(&filter, distance);
+                size_t filter_n = filter_effective_count(&filter);
+                double filt_mean = filter_mean(&filter);
+
+                printf("\n  >>> DISTANCE: %.3f m <<<\n", distance);
+                printf("  Filtered avg (n=%zu): %.3f m\n", filter_n, filt_mean);
+
+                stats_add(&g_stats, distance);
+                success_count++;
+                
+                if (g_stats.count >= 2) {
+                    stats_print(&g_stats);
+                }
             }
         } else {
             printf("\n  [WARN] Invalid distance: %.3f m\n", distance);
@@ -386,6 +493,14 @@ static void run_initiator(void) {
  *============================================================================*/
 
 static void run_responder(void) {
+    if (g_protocol == PROTO_DS) {
+        run_responder_ds();
+    } else {
+        run_responder_ss();
+    }
+}
+
+static void run_responder_ss(void) {
     printf("Starting ranging as responder. Waiting for polls...\n\n");
     
     uint32_t poll_count = 0;
@@ -497,11 +612,342 @@ static void run_responder(void) {
 }
 
 /*============================================================================
+ * Initiator Logic (DS-TWR)
+ *============================================================================*/
+
+static void run_initiator_ds(void) {
+    printf("Starting ranging as initiator (DS-TWR). Press Ctrl+C to stop.\n\n");
+
+    memset(&g_stats, 0, sizeof(g_stats));
+    uint32_t exchange_count = 0;
+    uint32_t success_count = 0;
+    uint32_t fail_count = 0;
+    avg_filter_t filter;
+    filter_reset(&filter);
+
+    const uint64_t final_delay_dtu = (uint64_t)(FINAL_DELAY_UUS * 1e-6 / DWT_TIME_UNITS);
+
+    while (g_running) {
+        exchange_count++;
+        printf("--- Exchange #%u ---\n", exchange_count);
+
+        uint64_t t1 = 0, t4 = 0;
+        uint64_t t2 = 0, t3 = 0;
+
+        /* Poll */
+        g_poll_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
+        if (!send_frame_and_wait(g_poll_frame, POLL_FRAME_LEN, &t1)) {
+            printf("  [FAIL] Poll TX failed\n\n");
+            fail_count++;
+            usleep(RANGING_INTERVAL_MS * 1000);
+            continue;
+        }
+        printf("  T1 (Poll TX)     : 0x%010" PRIX64 "\n", t1);
+
+        /* Wait for response */
+        uint32_t rx_timeout = (uint32_t)((REPLY_DELAY_UUS + RESP_RX_TIMEOUT_UUS) * 1.05);
+        dwt_setrxtimeout(rx_timeout);
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+        if (!wait_for_frame(RESP_RX_TIMEOUT_UUS * 2, MSG_TYPE_RESPONSE, &t4)) {
+            printf("  [FAIL] Response RX timeout\n\n");
+            fail_count++;
+            dwt_forcetrxoff();
+            usleep(RANGING_INTERVAL_MS * 1000);
+            continue;
+        }
+
+        printf("  T4 (Response RX) : 0x%010" PRIX64 "\n", t4);
+        t2 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET]);
+        t3 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET + 5]);
+        printf("  T2 (Poll RX @ B) : 0x%010" PRIX64 "\n", t2);
+        printf("  T3 (Resp TX @ B) : 0x%010" PRIX64 "\n", t3);
+
+        /* Schedule final */
+        uint64_t t5_target = t4 + final_delay_dtu;
+        if (t5_target <= t4) {
+            t5_target = t4 + final_delay_dtu;
+        }
+
+        g_final_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
+        timestamp_to_bytes(t1, &g_final_frame[FRAME_DATA_OFFSET]);
+        timestamp_to_bytes(t4, &g_final_frame[FRAME_DATA_OFFSET + 5]);
+        timestamp_to_bytes(t5_target, &g_final_frame[FRAME_DATA_OFFSET + 10]);
+
+        dwt_forcetrxoff();
+        dwt_writetxdata((uint16_t)FINAL_FRAME_LEN, g_final_frame, 0);
+        dwt_writetxfctrl((uint16_t)(FINAL_FRAME_LEN + 2), 0, 1);
+
+        uint64_t dx_target = t5_target - g_ant_dly;
+        uint32_t dx_reg = (uint32_t)(((dx_target >> 8) & 0xFFFFFFFE));
+        dwt_setdelayedtrxtime(dx_reg);
+
+        if (dwt_starttx(DWT_START_TX_DELAYED) != DWT_SUCCESS) {
+            printf("  [FAIL] Final TX scheduling failed\n\n");
+            fail_count++;
+            continue;
+        }
+
+        bool tx_done = false;
+        uint32_t timeout = 50000;
+        while (!tx_done && timeout--) {
+            uint32_t status = dwt_readsysstatuslo();
+            if (status & DWT_INT_TXFRS_BIT_MASK) {
+                dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
+                tx_done = true;
+            } else {
+                usleep(10);
+            }
+        }
+
+        if (!tx_done) {
+            printf("  [FAIL] Final TX timeout\n\n");
+            fail_count++;
+            continue;
+        }
+
+        uint64_t t5_actual = read_tx_timestamp();
+        printf("  T5 (Final TX)    : 0x%010" PRIX64 "\n", t5_actual);
+        int64_t t5_drift = (int64_t)(t5_actual - t5_target);
+        if (llabs(t5_drift) > 32) {
+            printf("  [WARN] T5 drift %+lld DWT\n", (long long)t5_drift);
+        }
+
+        /* Wait for result report */
+        dwt_setrxtimeout((uint32_t)(RESULT_RX_TIMEOUT_UUS * 1.05));
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        uint64_t dummy = 0;
+
+        if (!wait_for_frame(RESULT_RX_TIMEOUT_UUS * 2, MSG_TYPE_RESULT, &dummy)) {
+            printf("  [FAIL] Range result timeout\n\n");
+            fail_count++;
+            dwt_forcetrxoff();
+            usleep(RANGING_INTERVAL_MS * 1000);
+            continue;
+        }
+
+        int32_t distance_mm = bytes_to_int32(&g_rx_buffer[FRAME_DATA_OFFSET]);
+        uint8_t status = g_rx_buffer[FRAME_DATA_OFFSET + 4];
+        uint8_t remote_samples = g_rx_buffer[FRAME_DATA_OFFSET + 5];
+        double distance = (double)distance_mm / 1000.0;
+
+        if (status == RESULT_STATUS_OK) {
+            bool outlier = filter_is_outlier(&filter, distance, OUTLIER_THRESHOLD_M);
+            if (outlier) {
+                printf("  [SKIP] Local filter rejected %.3f m (threshold %.2f m)\n",
+                       distance, OUTLIER_THRESHOLD_M);
+                fail_count++;
+            } else {
+                filter_add(&filter, distance);
+                size_t filter_n = filter_effective_count(&filter);
+                double filt_mean = filter_mean(&filter);
+
+                printf("  >>> DISTANCE (DS): %.3f m <<<\n", distance);
+                printf("  Remote samples   : %u\n", remote_samples);
+                printf("  Filtered avg (n=%zu): %.3f m\n", filter_n, filt_mean);
+
+                stats_add(&g_stats, distance);
+                success_count++;
+                if (g_stats.count >= 2) {
+                    stats_print(&g_stats);
+                }
+            }
+        } else if (status == RESULT_STATUS_OUTLIER) {
+            printf("  [INFO] Responder marked measurement as outlier (%.3f m)\n", distance);
+            fail_count++;
+        } else {
+            printf("  [FAIL] Responder reported invalid exchange\n");
+            fail_count++;
+        }
+
+        printf("\n");
+        usleep(RANGING_INTERVAL_MS * 1000);
+    }
+
+    printf("\n=== Ranging Summary (DS) ===\n");
+    printf("Total exchanges: %u\n", exchange_count);
+    printf("Successful: %u (%.1f%%)\n", success_count,
+           exchange_count > 0 ? 100.0 * success_count / exchange_count : 0.0);
+    printf("Failed: %u\n", fail_count);
+    if (g_stats.count > 0) {
+        printf("\nFinal statistics:\n");
+        stats_print(&g_stats);
+    }
+}
+
+/*============================================================================
+ * Responder Logic (DS-TWR)
+ *============================================================================*/
+
+static void run_responder_ds(void) {
+    printf("Starting ranging as responder (DS-TWR). Waiting for polls...\n\n");
+
+    uint32_t poll_count = 0;
+    uint32_t success_count = 0;
+    avg_filter_t filter;
+    filter_reset(&filter);
+    stats_t resp_stats = { 0 };
+
+    const uint64_t reply_delay_dtu = (uint64_t)(REPLY_DELAY_UUS * 1e-6 / DWT_TIME_UNITS);
+    const uint64_t tx_ant_delay_dtu = g_ant_dly;
+
+    while (g_running) {
+        uint64_t t2 = 0;
+        uint64_t t3_target = 0;
+        uint64_t t3_actual = 0;
+
+        /* Wait for poll */
+        dwt_forcetrxoff();
+        dwt_setrxtimeout(0);
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+        if (!wait_for_frame(0, MSG_TYPE_POLL, &t2)) {
+            continue;
+        }
+
+        poll_count++;
+        printf("--- Poll #%u received ---\n", poll_count);
+        printf("  T2 (Poll RX)     : 0x%010" PRIX64 "\n", t2);
+
+        /* Schedule response */
+        t3_target = t2 + reply_delay_dtu;
+        if (t3_target <= t2) {
+            t3_target = t2 + reply_delay_dtu;
+        }
+
+        g_response_frame[FRAME_SEQ_OFFSET] = g_rx_buffer[FRAME_SEQ_OFFSET];
+        timestamp_to_bytes(t2, &g_response_frame[FRAME_DATA_OFFSET]);
+        timestamp_to_bytes(t3_target, &g_response_frame[FRAME_DATA_OFFSET + 5]);
+
+        dwt_forcetrxoff();
+        dwt_writetxdata((uint16_t)RESPONSE_FRAME_LEN, g_response_frame, 0);
+        dwt_writetxfctrl((uint16_t)(RESPONSE_FRAME_LEN + 2), 0, 1);
+
+        uint64_t dx_target = t3_target - tx_ant_delay_dtu;
+        uint32_t dx_reg = (uint32_t)(((dx_target >> 8) & 0xFFFFFFFE));
+        dwt_setdelayedtrxtime(dx_reg);
+
+        if (dwt_starttx(DWT_START_TX_DELAYED) != DWT_SUCCESS) {
+            printf("  [FAIL] Response TX scheduling failed\n");
+            continue;
+        }
+
+        bool tx_done = false;
+        uint32_t timeout = 50000;
+        while (!tx_done && timeout--) {
+            uint32_t status = dwt_readsysstatuslo();
+            if (status & DWT_INT_TXFRS_BIT_MASK) {
+                dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
+                tx_done = true;
+            } else {
+                usleep(10);
+            }
+        }
+
+        if (!tx_done) {
+            printf("  [FAIL] Response TX timeout\n");
+            continue;
+        }
+
+        t3_actual = read_tx_timestamp();
+        printf("  T3 (Resp TX)     : 0x%010" PRIX64 "\n", t3_actual);
+
+        /* Wait for final */
+        dwt_setrxtimeout((uint32_t)((FINAL_DELAY_UUS + RESP_RX_TIMEOUT_UUS) * 1.05));
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        uint64_t t6 = 0;
+
+        if (!wait_for_frame((FINAL_DELAY_UUS + RESP_RX_TIMEOUT_UUS) * 2, MSG_TYPE_FINAL, &t6)) {
+            printf("  [FAIL] Final RX timeout\n\n");
+            continue;
+        }
+
+        uint64_t t1 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET]);
+        uint64_t t4 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET + 5]);
+        uint64_t t5 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET + 10]);
+
+        printf("  T6 (Final RX)    : 0x%010" PRIX64 "\n", t6);
+
+        int64_t ra = (int64_t)(t4 - t1);
+        int64_t rb = (int64_t)(t6 - t3_actual);
+        int64_t da = (int64_t)(t5 - t4);
+        int64_t db = (int64_t)(t3_actual - t2);
+
+        printf("  Ra=%" PRId64 "  Rb=%" PRId64 "  Da=%" PRId64 "  Db=%" PRId64 "\n",
+               ra, rb, da, db);
+
+        double numerator = (double)ra * (double)rb - (double)da * (double)db;
+        double denominator = (double)ra + (double)rb + (double)da + (double)db;
+
+        double distance = -1.0;
+        uint8_t status = RESULT_STATUS_ERROR;
+
+        if (denominator > 0.0) {
+            double tof_dtu = numerator / denominator;
+            distance = tof_dtu * DWT_TIME_UNITS * SPEED_OF_LIGHT_M_S;
+            if (distance >= 0.0 && distance < 200.0) {
+                status = RESULT_STATUS_OK;
+            }
+        }
+
+        if (status == RESULT_STATUS_OK) {
+            bool outlier = filter_is_outlier(&filter, distance, OUTLIER_THRESHOLD_M);
+            if (outlier) {
+                status = RESULT_STATUS_OUTLIER;
+                printf("  [SKIP] Filter rejected %.3f m (threshold %.2f m)\n",
+                       distance, OUTLIER_THRESHOLD_M);
+            } else {
+                filter_add(&filter, distance);
+                size_t filter_n = filter_effective_count(&filter);
+                double filt_mean = filter_mean(&filter);
+                stats_add(&resp_stats, distance);
+                success_count++;
+                printf("  >>> DISTANCE (DS): %.3f m <<<\n", distance);
+                printf("  Filtered avg (n=%zu): %.3f m\n", filter_n, filt_mean);
+            }
+        } else if (status == RESULT_STATUS_ERROR) {
+            printf("  [FAIL] Invalid DS computation (numerator %.3e, denominator %.3e)\n",
+                   numerator, denominator);
+        }
+
+        /* Send result back to initiator */
+        int32_t distance_mm = (status == RESULT_STATUS_OK) ?
+            (int32_t)llround(distance * 1000.0) : 0;
+
+        g_result_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
+        int32_to_bytes(distance_mm, &g_result_frame[FRAME_DATA_OFFSET]);
+        g_result_frame[FRAME_DATA_OFFSET + 4] = status;
+        g_result_frame[FRAME_DATA_OFFSET + 5] =
+            (uint8_t)filter_effective_count(&filter);
+        g_result_frame[FRAME_DATA_OFFSET + 6] = 0;
+        g_result_frame[FRAME_DATA_OFFSET + 7] = 0;
+
+        dwt_forcetrxoff();
+        if (!send_frame_and_wait(g_result_frame, RESULT_FRAME_LEN, NULL)) {
+            printf("  [WARN] Failed to transmit result frame\n");
+        }
+
+        printf("\n");
+    }
+
+    printf("\n=== Responder Summary (DS) ===\n");
+    printf("Polls received: %u\n", poll_count);
+    printf("Successful ranges: %u\n", success_count);
+    if (resp_stats.count > 0) {
+        stats_print(&resp_stats);
+    }
+}
+
+/*============================================================================
  * Calibration Mode
  *============================================================================*/
 
 static void run_calibration(void) {
     printf("=== Antenna Delay Calibration ===\n");
+    if (g_protocol == PROTO_DS) {
+        printf("NOTE: Calibration currently runs in SS-TWR mode. "
+               "Use '--protocol ss' for consistent results.\n");
+    }
     printf("True distance: %.3f m\n", g_calibration_distance);
     printf("Using antenna delay: %u DWT (%.2f ns)\n",
            g_ant_dly, g_ant_dly * DWT_TIME_UNITS * 1e9);
@@ -510,6 +956,8 @@ static void run_calibration(void) {
     printf("Running 50 measurements...\n\n");
 
     stats_t cal_stats = { 0 };
+    avg_filter_t cal_filter;
+    filter_reset(&cal_filter);
     uint32_t success = 0;
     const uint32_t target = 50;
 
@@ -542,12 +990,19 @@ static void run_calibration(void) {
         double distance = calculate_distance(ra, db);
 
         if (distance >= 0 && distance < 100.0) {
-            stats_add(&cal_stats, distance);
-            success++;
-            printf("[%2u/%u] Measured: %.3f m (Ra=%.1fμs, Db=%.1fμs)\n", 
-                   success, target, distance,
-                   ra * DWT_TIME_UNITS * 1e6,
-                   db * DWT_TIME_UNITS * 1e6);
+            bool outlier = filter_is_outlier(&cal_filter, distance, OUTLIER_THRESHOLD_M);
+            if (outlier) {
+                printf("[--/--] [SKIP] Outlier: %.3f m (window %.2f m)\n",
+                       distance, OUTLIER_THRESHOLD_M);
+            } else {
+                filter_add(&cal_filter, distance);
+                stats_add(&cal_stats, distance);
+                success++;
+                printf("[%2u/%u] Measured: %.3f m (Ra=%.1fμs, Db=%.1fμs)\n", 
+                       success, target, distance,
+                       ra * DWT_TIME_UNITS * 1e6,
+                       db * DWT_TIME_UNITS * 1e6);
+            }
         }
 
         usleep(200000);
@@ -711,6 +1166,20 @@ static uint64_t read_rx_timestamp(void) {
     return bytes_to_timestamp(ts);
 }
 
+static void int32_to_bytes(int32_t value, uint8_t *bytes) {
+    bytes[0] = (uint8_t)(value & 0xFF);
+    bytes[1] = (uint8_t)((value >> 8) & 0xFF);
+    bytes[2] = (uint8_t)((value >> 16) & 0xFF);
+    bytes[3] = (uint8_t)((value >> 24) & 0xFF);
+}
+
+static int32_t bytes_to_int32(const uint8_t *bytes) {
+    return (int32_t)((uint32_t)bytes[0] |
+                     ((uint32_t)bytes[1] << 8) |
+                     ((uint32_t)bytes[2] << 16) |
+                     ((uint32_t)bytes[3] << 24));
+}
+
 /*============================================================================
  * Distance Calculation (SS-TWR)
  *============================================================================*/
@@ -769,4 +1238,55 @@ static void stats_print(const stats_t *s) {
     
     printf("  Stats (n=%zu): Mean=%.3f m | StdDev=%.3f m | Range=[%.3f, %.3f] m\n",
            s->count, mean, std_dev, min_val, max_val);
+}
+
+/*============================================================================
+ * Sliding Window Filter Helpers
+ *============================================================================*/
+
+static void filter_reset(avg_filter_t *f) {
+    memset(f, 0, sizeof(*f));
+}
+
+static void filter_add(avg_filter_t *f, double sample) {
+    if (f->count < FILTER_WINDOW_SIZE) {
+        f->samples[f->index] = sample;
+        f->sum += sample;
+        f->count++;
+        f->index = (f->index + 1U) % FILTER_WINDOW_SIZE;
+        return;
+    }
+
+    /* Window full: overwrite oldest */
+    if (f->index >= FILTER_WINDOW_SIZE) {
+        f->index = 0;
+    }
+    f->sum -= f->samples[f->index];
+    f->samples[f->index] = sample;
+    f->sum += sample;
+    f->index = (f->index + 1U) % FILTER_WINDOW_SIZE;
+}
+
+static double filter_mean(const avg_filter_t *f) {
+    if (f->count == 0) {
+        return 0.0;
+    }
+    size_t effective = filter_effective_count(f);
+    return (effective > 0) ? (f->sum / (double)effective) : 0.0;
+}
+
+static size_t filter_effective_count(const avg_filter_t *f) {
+    return (f->count < FILTER_WINDOW_SIZE) ? f->count : FILTER_WINDOW_SIZE;
+}
+
+static bool filter_is_ready(const avg_filter_t *f) {
+    return filter_effective_count(f) >= FILTER_WARMUP_COUNT;
+}
+
+static bool filter_is_outlier(const avg_filter_t *f, double sample, double threshold) {
+    if (!filter_is_ready(f)) {
+        return false;
+    }
+    double mean = filter_mean(f);
+    return fabs(sample - mean) > threshold;
 }
