@@ -276,7 +276,9 @@ static bool wait_for_frame(uint8_t expected_type, uint64_t *rx_ts, uint8_t *rece
 
         if (status & (SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_TO)) {
             dwt_writesysstatuslo(SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_TO);
-            return false;
+            /* Hardware RX timeout/error - not fatal if we have software time left */
+            /* Re-enable RX and keep waiting until software timeout expires */
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
         }
 
         usleep(100);
@@ -452,8 +454,9 @@ static int run_responder(void) {
             /* Wait indefinitely for first poll */
             dwt_setrxtimeout(0);
         } else {
-            /* After first poll, use generous timeout to detect when initiator is done */
-            dwt_setrxtimeout(RESPONDER_IDLE_TIMEOUT_UUS);
+            /* After first poll, set HW timeout to 1 second */
+            /* Software loop will handle the full 15s wait by re-enabling RX on HW timeout */
+            dwt_setrxtimeout(1000000U);  /* 1 second */
         }
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
