@@ -1,10 +1,6 @@
 #include <stdio.h>
-#include "spi_driver.h"  // For spi_init, spi_close declarations
-#include "deca_device_api.h"  // For chip_init declaration
 
-/* Forward declaration if init.c doesn't have a header */
-int chip_init(void);
-void chip_shutdown(void);
+#include "init.h"
 
 int main() {
     if (chip_init() != 0) {
