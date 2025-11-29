@@ -401,13 +401,13 @@ static void run_responder(void) {
      * - Safety margin
      * 
      * 3ms is very conservative but guarantees success.
+     * Uses REPLY_DELAY_UUS macro defined at top of file.
      */
-    const uint64_t REPLY_DELAY_UUS = 3000;  /* 3ms in microseconds */
-    const uint64_t REPLY_DELAY_DTU = (uint64_t)(REPLY_DELAY_UUS * 1e-6 / DWT_TIME_UNITS);
+    const uint64_t reply_delay_dtu = (uint64_t)(REPLY_DELAY_UUS * 1e-6 / DWT_TIME_UNITS);
     
-    printf("Reply delay: %llu μs (%llu DWT units)\n\n", 
-           (unsigned long long)REPLY_DELAY_UUS, 
-           (unsigned long long)REPLY_DELAY_DTU);
+    printf("Reply delay: %u μs (%llu DWT units)\n\n", 
+           REPLY_DELAY_UUS, 
+           (unsigned long long)reply_delay_dtu);
     
     while (g_running) {
         uint64_t t2 = 0, t3_scheduled = 0;
@@ -426,8 +426,8 @@ static void run_responder(void) {
         printf("  T2 (Poll RX)     : 0x%010" PRIX64 "\n", t2);
 
         /* ===== Step 2: Calculate scheduled T3 and prepare response ===== */
-        /* Schedule TX at T2 + REPLY_DELAY */
-        t3_scheduled = t2 + REPLY_DELAY_DTU;
+        /* Schedule TX at T2 + reply_delay */
+        t3_scheduled = t2 + reply_delay_dtu;
         
         /* Embed T2 and T3 in response */
         g_response_frame[FRAME_SEQ_OFFSET] = g_rx_buffer[FRAME_SEQ_OFFSET];
