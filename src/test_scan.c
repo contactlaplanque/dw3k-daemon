@@ -33,9 +33,10 @@ static struct timeval scan_start = { 0 };
 static void handle_sigint(int sig);
 static unsigned int parse_duration(int argc, char **argv);
 static void print_local_identity(void);
+static bool fetch_device_eui(uint8_t *eui, bool *synthetic);
 static void configure_scan_mode(void);
-static void install_callbacks(void);
 static void scan_loop(unsigned int duration_s);
+static bool process_rx_status(void);
 static void log_frame(const uint8_t *frame, uint16_t len);
 static const char *frame_type_to_string(uint16_t frame_control);
 static size_t consume_address(const uint8_t *payload,
@@ -46,9 +47,6 @@ static size_t consume_address(const uint8_t *payload,
 static void format_address(const struct ieee154_addr *addr, char *buffer, size_t len);
 static void print_address_line(const char *label, const struct ieee154_addr *addr);
 static double seconds_since_start(void);
-static void rx_ok_cb(const dwt_cb_data_t *cb_data);
-static void rx_err_cb(const dwt_cb_data_t *cb_data);
-static void rx_to_cb(const dwt_cb_data_t *cb_data);
 
 int main(int argc, char **argv) {
     unsigned int duration_s = parse_duration(argc, argv);
@@ -64,7 +62,6 @@ int main(int argc, char **argv) {
     }
 
     print_local_identity();
-    install_callbacks();
     gettimeofday(&scan_start, NULL);
     configure_scan_mode();
 
@@ -105,22 +102,49 @@ static unsigned int parse_duration(int argc, char **argv) {
 
 static void print_local_identity(void) {
     uint8_t eui[8] = { 0 };
-    dwt_geteui(eui);
+    bool synthetic = false;
+    fetch_device_eui(eui, &synthetic);
 
     printf("Local UWB identity:\n");
     printf("  Device ID: 0x%08" PRIX32 "\n", dwt_readdevid());
-    printf("  EUI-64   : %02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X\n",
-           eui[0], eui[1], eui[2], eui[3], eui[4], eui[5], eui[6], eui[7]);
+    printf("  EUI-64   : %02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X%s\n",
+           eui[0], eui[1], eui[2], eui[3], eui[4], eui[5], eui[6], eui[7],
+           synthetic ? " (derived from lot/part IDs)" : "");
     printf("  Short addr / PAN ID follow the values you configure in chip_init().\n\n");
 }
 
-static void install_callbacks(void) {
-    dwt_callbacks_s callbacks;
-    memset(&callbacks, 0, sizeof(callbacks));
-    callbacks.cbRxOk = rx_ok_cb;
-    callbacks.cbRxErr = rx_err_cb;
-    callbacks.cbRxTo = rx_to_cb;
-    dwt_setcallbacks(&callbacks);
+static bool fetch_device_eui(uint8_t *eui, bool *synthetic) {
+    uint8_t tmp[8] = { 0 };
+    dwt_geteui(tmp);
+
+    bool all_zero = true;
+    for (size_t i = 0; i < sizeof(tmp); i++) {
+        if (tmp[i] != 0U) {
+            all_zero = false;
+            break;
+        }
+    }
+
+    if (!all_zero) {
+        memcpy(eui, tmp, sizeof(tmp));
+        if (synthetic != NULL) {
+            *synthetic = false;
+        }
+        return true;
+    }
+
+    uint64_t lot = dwt_getlotid();
+    uint32_t part = dwt_getpartid();
+    uint64_t derived = ((lot & 0x0000FFFFFFFFFFFFULL) << 16) | (uint64_t)(part & 0xFFFFU);
+
+    for (size_t i = 0; i < sizeof(tmp); i++) {
+        eui[i] = (uint8_t)((derived >> (8U * (7U - i))) & 0xFFU);
+    }
+
+    if (synthetic != NULL) {
+        *synthetic = true;
+    }
+    return false;
 }
 
 static void configure_scan_mode(void) {
@@ -131,6 +155,7 @@ static void configure_scan_mode(void) {
         (uint32_t)SYS_STATUS_ALL_RX_TO;
 
     dwt_setinterrupt(rx_events, 0, DWT_ENABLE_INT);
+    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_GOOD | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_TO);
 
     dwt_forcetrxoff();
     dwt_configureframefilter(DWT_FF_DISABLE, 0);
@@ -141,9 +166,7 @@ static void configure_scan_mode(void) {
 
 static void scan_loop(unsigned int duration_s) {
     while (keep_running) {
-        while (dwt_checkirq()) {
-            dwt_isr();
-        }
+        bool handled = process_rx_status();
 
         if (duration_s > 0) {
             double elapsed = seconds_since_start();
@@ -152,37 +175,53 @@ static void scan_loop(unsigned int duration_s) {
             }
         }
 
-        usleep(IRQ_POLL_INTERVAL_US);
+        if (!handled) {
+            usleep(IRQ_POLL_INTERVAL_US);
+        }
     }
 }
 
-static void rx_ok_cb(const dwt_cb_data_t *cb_data) {
-    uint16_t length = cb_data->datalength;
-    if (length > RX_BUFFER_LEN) {
-        length = RX_BUFFER_LEN;
+static bool process_rx_status(void) {
+    uint32_t status = dwt_readsysstatuslo();
+    uint32_t clear_mask = 0U;
+    bool handled = false;
+
+    if ((status & SYS_STATUS_ALL_RX_GOOD) != 0U) {
+        uint8_t rng = 0U;
+        uint16_t length = dwt_getframelength(&rng);
+        if (length > RX_BUFFER_LEN) {
+            length = RX_BUFFER_LEN;
+        }
+
+        dwt_readrxdata(rx_buffer, length, 0);
+        frames_ok++;
+        log_frame(rx_buffer, length);
+        clear_mask |= SYS_STATUS_ALL_RX_GOOD;
+        (void)dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        handled = true;
     }
 
-    dwt_readrxdata(rx_buffer, length, 0);
-    frames_ok++;
-    log_frame(rx_buffer, length);
+    if ((status & SYS_STATUS_ALL_RX_ERR) != 0U) {
+        frames_err++;
+        clear_mask |= SYS_STATUS_ALL_RX_ERR;
+        dwt_forcetrxoff();
+        (void)dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        handled = true;
+    }
 
-    (void)dwt_rxenable(DWT_START_RX_IMMEDIATE);
-}
+    if ((status & SYS_STATUS_ALL_RX_TO) != 0U) {
+        frames_timeout++;
+        clear_mask |= SYS_STATUS_ALL_RX_TO;
+        dwt_forcetrxoff();
+        (void)dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        handled = true;
+    }
 
-static void rx_err_cb(const dwt_cb_data_t *cb_data) {
-    (void)cb_data;
-    frames_err++;
+    if (clear_mask != 0U) {
+        dwt_writesysstatuslo(clear_mask);
+    }
 
-    dwt_forcetrxoff();
-    (void)dwt_rxenable(DWT_START_RX_IMMEDIATE);
-}
-
-static void rx_to_cb(const dwt_cb_data_t *cb_data) {
-    (void)cb_data;
-    frames_timeout++;
-
-    dwt_forcetrxoff();
-    (void)dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    return handled;
 }
 
 static const char *frame_type_to_string(uint16_t frame_control) {
