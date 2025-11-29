@@ -175,6 +175,27 @@ static int create_server_socket(const char *path) {
     return fd;
 }
 
+static int accept_client(int server_fd) {
+#if defined(__linux__) && defined(SOCK_CLOEXEC)
+    int fd = accept4(server_fd, NULL, NULL, SOCK_CLOEXEC);
+    if (fd >= 0) {
+        return fd;
+    }
+    if (errno != ENOSYS && errno != EINVAL) {
+        return -1;
+    }
+#endif
+    int fd = accept(server_fd, NULL, NULL);
+    if (fd < 0) {
+        return fd;
+    }
+    int flags = fcntl(fd, F_GETFD);
+    if (flags != -1) {
+        fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+    }
+    return fd;
+}
+
 static int ensure_config_file(daemon_state_t *state) {
     if (access(state->config_path, F_OK) == 0) {
         return 0;
@@ -312,10 +333,8 @@ static void *monitor_thread_main(void *arg) {
 
         if (chip_active && !hw_busy) {
             bool ok = false;
-            uint32_t devid = 0;
             pthread_mutex_lock(&state->hw_mutex);
-            devid = dwt_readdevid();
-            ok = (devid == DWT_DEVICE_ID);
+            ok = (dwt_check_dev_id() == DWT_SUCCESS);
             pthread_mutex_unlock(&state->hw_mutex);
 
             pthread_mutex_lock(&state->lock);
@@ -323,7 +342,7 @@ static void *monitor_thread_main(void *arg) {
             if (ok) {
                 snprintf(state->last_health_msg, sizeof(state->last_health_msg), "device ready");
             } else {
-                snprintf(state->last_health_msg, sizeof(state->last_health_msg), "unexpected dev id 0x%08X", devid);
+                snprintf(state->last_health_msg, sizeof(state->last_health_msg), "device id mismatch");
             }
             pthread_mutex_unlock(&state->lock);
         }
@@ -798,7 +817,7 @@ static void handle_client_request(int fd, const char *req, daemon_state_t *state
 static void event_loop(daemon_state_t *state) {
     char buffer[MAX_REQUEST_SIZE];
     while (!g_should_terminate) {
-        int client_fd = accept4(state->server_fd, NULL, NULL, SOCK_CLOEXEC);
+        int client_fd = accept_client(state->server_fd);
         if (client_fd < 0) {
             if (errno == EINTR) continue;
             log_message(LOG_ERR, "accept() failed: %s", strerror(errno));
