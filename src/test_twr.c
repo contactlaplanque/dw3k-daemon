@@ -708,7 +708,7 @@ static uint64_t read_tx_timestamp(void) {
 
 static uint64_t read_rx_timestamp(void) {
     uint8_t ts[5];
-    dwt_readrxtimestamp(ts);
+    dwt_readrxtimestamp(ts, DWT_COMPAT_NONE);  /* DWT_COMPAT_NONE for single-receiver devices */
     return bytes_to_timestamp(ts);
 }
 
