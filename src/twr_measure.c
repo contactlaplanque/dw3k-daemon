@@ -59,7 +59,7 @@
 #define TX_TO_TX_DELAY_US       3000U   /* 3ms delay between Final and Report - critical for accuracy */
 #define MAX_STAGE_RETRIES       2U
 #define MAX_WAIT_RETRIES        2U
-#define FAST_RANGING_INTERVAL_US 30000U  /* 30ms between measurements - balanced speed/reliability */
+#define FAST_RANGING_INTERVAL_US 15000U  /* 15ms between measurements - balanced speed/reliability */
 #define RESPONDER_IDLE_TIMEOUT_UUS 15000000U  /* 15s timeout after polling starts */
 #define DEFAULT_WAIT_TIMEOUT_US (RX_TIMEOUT_UUS * 2U)  /* ~40ms */
 
@@ -68,7 +68,7 @@
 #define DWT_TIME_UNITS      (1.0 / 499.2e6 / 128.0)
 
 /* Default antenna delay (DWT units) */
-#define DEFAULT_ANT_DLY     16386U
+#define DEFAULT_ANT_DLY     16385U
 
 /* Filtering - use dynamic allocation to handle any measurement count */
 #define MAX_MEASUREMENTS        1000U  /* Maximum samples we can handle */
