@@ -524,17 +524,24 @@ static void run_responder(void) {
         }
         printf("  T6=0x%010" PRIX64 "\n", t6);
 
-        /* [4] Wait for REPORT with retries */
+        /* [4] Wait for REPORT - immediately re-enable RX after FINAL */
+        /* Note: wait_for_frame leaves RX disabled after successful reception */
+        /* Clear any pending RX status before re-enabling */
+        dwt_writesysstatuslo(SYS_STATUS_ALL_RX_GOOD | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_TO);
+        dwt_setrxtimeout((uint32_t)(RX_TIMEOUT_UUS * 2));
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        
         bool report_ok = false;
         for (uint32_t attempt = 0; attempt < MAX_WAIT_RETRIES; ++attempt) {
-            dwt_forcetrxoff();
-            dwt_setrxtimeout((uint32_t)(RX_TIMEOUT_UUS * 2));
-            dwt_rxenable(DWT_START_RX_IMMEDIATE);
             if (wait_for_frame(MSG_TYPE_REPORT, NULL)) {
                 report_ok = true;
                 break;
             }
             printf("  [WARN] Report timeout (attempt %u)\n", attempt + 1);
+            /* Re-enable RX for retry */
+            dwt_forcetrxoff();
+            dwt_setrxtimeout((uint32_t)(RX_TIMEOUT_UUS * 2));
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
         }
         if (!report_ok) {
             printf("  [FAIL] Report timeout\n\n");
