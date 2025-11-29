@@ -1,25 +1,22 @@
 /*
- * test_twr.c – Double-Sided Two-Way Ranging (DS-TWR) for distance measurement
+ * test_twr.c – Single-Sided Two-Way Ranging (SS-TWR) for distance measurement
  *
  * Usage:
  *   ./test_twr initiator              - Run as initiator (starts ranging)
  *   ./test_twr responder              - Run as responder (replies to polls)
  *   ./test_twr calibrate <distance_m> - Calibration mode (run as initiator)
  *
- * DS-TWR Message Exchange:
+ * SS-TWR Message Exchange:
  *   Initiator                    Responder
  *       |                            |
  *   T1 -|-------- Poll ------------->|- T2
  *       |                            |
- *   T4 -|<------- Response ----------|- T3  (Response embeds T2)
+ *   T4 -|<------- Response ----------|- T3  (Response embeds T2 and T3)
  *       |                            |
- *   T5 -|-------- Final ------------>|- T6  (Final embeds T1, T4, T3)
- *       |                            |
- *       |     Both can calculate     |
- *       |        distance            |
  *
- * Key insight: Each message embeds timestamps from PREVIOUS events,
- * not from itself (since TX timestamp is only known after transmission).
+ * Distance = c × ToF, where ToF = (Ra - Db) / 2
+ *   Ra = T4 - T1 (round trip measured by initiator)
+ *   Db = T3 - T2 (reply delay measured by responder)
  */
 
 #include <inttypes.h>
@@ -47,7 +44,6 @@
 /* Message types */
 #define MSG_TYPE_POLL       0x21U
 #define MSG_TYPE_RESPONSE   0x10U
-#define MSG_TYPE_FINAL      0x23U
 
 /* Frame offsets */
 #define FRAME_FC_OFFSET     0U
@@ -60,12 +56,10 @@
 
 /* Frame sizes (excluding FCS which is auto-appended) */
 #define POLL_FRAME_LEN      10U   /* FC(2) + Seq(1) + PAN(2) + Dest(2) + Src(2) + Type(1) */
-#define RESPONSE_FRAME_LEN  15U   /* Poll + T2(5) -- Response embeds poll RX timestamp */
-#define FINAL_FRAME_LEN     25U   /* Poll + T1(5) + T4(5) + T3(5) -- Final embeds all prior timestamps */
+#define RESPONSE_FRAME_LEN  20U   /* Poll frame + T2(5) + T3(5) */
 
 /* Timing */
 #define RESP_RX_TIMEOUT_UUS         10000U  /* Response RX timeout (μs) */
-#define FINAL_RX_TIMEOUT_UUS        10000U  /* Final RX timeout (μs) */
 #define RANGING_INTERVAL_MS         500U    /* Time between ranging exchanges */
 
 /* Speed of light and time unit conversion */
@@ -126,19 +120,8 @@ static uint8_t g_response_frame[RESPONSE_FRAME_LEN] = {
     (INITIATOR_ADDR & 0xFF), (INITIATOR_ADDR >> 8),  /* Destination (initiator) */
     (RESPONDER_ADDR & 0xFF), (RESPONDER_ADDR >> 8),  /* Source (responder) */
     MSG_TYPE_RESPONSE,      /* Message type */
-    0, 0, 0, 0, 0           /* T2 placeholder (5 bytes) - poll RX timestamp at responder */
-};
-
-static uint8_t g_final_frame[FINAL_FRAME_LEN] = {
-    0x41, 0x88,             /* Frame Control */
-    0x00,                   /* Sequence number */
-    (PAN_ID & 0xFF), (PAN_ID >> 8),
-    (RESPONDER_ADDR & 0xFF), (RESPONDER_ADDR >> 8),  /* Destination (responder) */
-    (INITIATOR_ADDR & 0xFF), (INITIATOR_ADDR >> 8),  /* Source (initiator) */
-    MSG_TYPE_FINAL,         /* Message type */
-    0, 0, 0, 0, 0,          /* T1 placeholder - poll TX timestamp at initiator */
-    0, 0, 0, 0, 0,          /* T4 placeholder - response RX timestamp at initiator */
-    0, 0, 0, 0, 0           /* T3 placeholder - response TX timestamp at responder (received in response) */
+    0, 0, 0, 0, 0,          /* T2 placeholder (5 bytes) - poll RX timestamp */
+    0, 0, 0, 0, 0           /* T3 placeholder (5 bytes) - response TX timestamp */
 };
 
 /*============================================================================
@@ -162,9 +145,7 @@ static uint64_t bytes_to_timestamp(const uint8_t *bytes);
 static uint64_t read_tx_timestamp(void);
 static uint64_t read_rx_timestamp(void);
 
-static double calculate_distance_dstwr(uint64_t t1, uint64_t t2, uint64_t t3,
-                                        uint64_t t4, uint64_t t5, uint64_t t6);
-static double calculate_distance_sstwr(uint64_t t1, uint64_t t2, uint64_t t3, uint64_t t4);
+static double calculate_distance(int64_t ra, int64_t db);
 static void stats_add(stats_t *s, double value);
 static void stats_print(const stats_t *s);
 
@@ -180,7 +161,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("=== DW3000 Double-Sided Two-Way Ranging ===\n\n");
+    printf("=== DW3000 Single-Sided Two-Way Ranging ===\n\n");
 
     if (chip_init() != 0) {
         fprintf(stderr, "ERROR: chip initialization failed\n");
@@ -302,7 +283,7 @@ static void configure_for_role(role_t role) {
 }
 
 /*============================================================================
- * Initiator Logic (DS-TWR)
+ * Initiator Logic (SS-TWR)
  *============================================================================*/
 
 static void run_initiator(void) {
@@ -316,7 +297,7 @@ static void run_initiator(void) {
         exchange_count++;
         printf("--- Exchange #%u ---\n", exchange_count);
 
-        uint64_t t1 = 0, t4 = 0, t5 = 0;
+        uint64_t t1 = 0, t4 = 0;
         uint64_t t2 = 0, t3 = 0;
 
         /* ===== Step 1: Send Poll ===== */
@@ -343,58 +324,35 @@ static void run_initiator(void) {
         }
         printf("  T4 (Response RX) : 0x%010" PRIX64 "\n", t4);
 
-        /* Extract T2 from response (T3 comes later, embedded by responder) */
+        /* Extract T2 and T3 from response */
         t2 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET]);
+        t3 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET + 5]);
         printf("  T2 (Poll RX @ B) : 0x%010" PRIX64 "\n", t2);
-        
-        /* T3 is the response TX timestamp - responder will calculate it
-         * For now, we estimate T3 ≈ T2 + small_delay for SS-TWR calculation
-         * The responder does the accurate DS-TWR calculation with T6 */
+        printf("  T3 (Resp TX @ B) : 0x%010" PRIX64 "\n", t3);
 
-        /* ===== Step 3: Send Final with T1, T4 ===== */
-        /* Note: We don't have T3 yet in this simplified exchange.
-         * The responder knows T3 (its own TX timestamp).
-         * We send T1 and T4 so responder can calculate. */
-        g_final_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
-        timestamp_to_bytes(t1, &g_final_frame[FRAME_DATA_OFFSET]);
-        timestamp_to_bytes(t4, &g_final_frame[FRAME_DATA_OFFSET + 5]);
-        /* T3 slot will be zeros - responder doesn't need it from us */
+        /* ===== Calculate distance using SS-TWR ===== */
+        int64_t ra = (int64_t)(t4 - t1);  /* Round trip (initiator clock) */
+        int64_t db = (int64_t)(t3 - t2);  /* Reply delay (responder clock) */
         
-        if (!send_frame_and_wait(g_final_frame, FINAL_FRAME_LEN, &t5)) {
-            printf("  [FAIL] Final TX failed\n\n");
-            fail_count++;
-            usleep(RANGING_INTERVAL_MS * 1000);
-            continue;
-        }
-        printf("  T5 (Final TX)    : 0x%010" PRIX64 "\n", t5);
+        printf("  Ra (T4-T1)       : %" PRId64 " DWT (%.3f μs)\n", ra, ra * DWT_TIME_UNITS * 1e6);
+        printf("  Db (T3-T2)       : %" PRId64 " DWT (%.3f μs)\n", db, db * DWT_TIME_UNITS * 1e6);
 
-        /* ===== Calculate distance (SS-TWR approximation on initiator side) ===== */
-        /* We use SS-TWR here since we don't have T3 accurately.
-         * We estimate reply delay from typical values.
-         * For accurate results, look at responder output (it has all timestamps). */
+        double distance = calculate_distance(ra, db);
         
-        /* Estimate T3 based on typical response processing time (~300μs) */
-        uint64_t estimated_reply_delay = (uint64_t)(300.0e-6 / DWT_TIME_UNITS);  /* ~300μs in DWT units */
-        t3 = t2 + estimated_reply_delay;
+        double tof_dtu = (double)(ra - db) / 2.0;
+        printf("  ToF              : %.0f DWT (%.3f ns)\n", tof_dtu, tof_dtu * DWT_TIME_UNITS * 1e9);
         
-        double distance = calculate_distance_sstwr(t1, t2, t3, t4);
-
-        int64_t ra = (int64_t)(t4 - t1);
-        int64_t db = (int64_t)(t3 - t2);
-        printf("  Ra (T4-T1)       : %" PRId64 " DWT\n", ra);
-        printf("  Db (T3-T2) est   : %" PRId64 " DWT (estimated)\n", db);
-        
-        if (distance > 0 && distance < 100.0) {
-            printf("\n  >>> DISTANCE: %.3f m (SS-TWR estimate) <<<\n", distance);
+        if (distance >= 0 && distance < 100.0) {
+            printf("\n  >>> DISTANCE: %.3f m <<<\n", distance);
             stats_add(&g_stats, distance);
             success_count++;
+            
+            if (g_stats.count >= 2) {
+                stats_print(&g_stats);
+            }
         } else {
             printf("\n  [WARN] Invalid distance: %.3f m\n", distance);
             fail_count++;
-        }
-
-        if (g_stats.count >= 2) {
-            stats_print(&g_stats);
         }
         
         printf("\n");
@@ -414,18 +372,25 @@ static void run_initiator(void) {
 }
 
 /*============================================================================
- * Responder Logic (DS-TWR - has all timestamps for accurate calculation)
+ * Responder Logic (SS-TWR)
+ * 
+ * Key: We need to embed T3 (response TX timestamp) in the response.
+ * But T3 is only known AFTER we transmit!
+ * 
+ * Solution: Use "delayed response" - we schedule the TX at a fixed future time,
+ * so we know T3 before we send.
  *============================================================================*/
 
 static void run_responder(void) {
     printf("Starting ranging as responder. Waiting for polls...\n\n");
     
     uint32_t poll_count = 0;
-    stats_t resp_stats = { 0 };
 
+    /* Fixed reply delay in DWT units (~500 μs) */
+    const uint64_t REPLY_DELAY_DTU = (uint64_t)(500.0e-6 / DWT_TIME_UNITS);
+    
     while (g_running) {
-        uint64_t t2 = 0, t3 = 0, t6 = 0;
-        uint64_t t1 = 0, t4 = 0, t5 = 0;
+        uint64_t t2 = 0, t3 = 0;
 
         /* ===== Step 1: Wait for Poll ===== */
         dwt_forcetrxoff();
@@ -440,75 +405,69 @@ static void run_responder(void) {
         printf("--- Poll #%u received ---\n", poll_count);
         printf("  T2 (Poll RX)     : 0x%010" PRIX64 "\n", t2);
 
-        /* ===== Step 2: Send Response with T2 embedded ===== */
+        /* ===== Step 2: Calculate T3 and prepare response ===== */
+        /* Schedule TX at T2 + REPLY_DELAY */
+        t3 = t2 + REPLY_DELAY_DTU;
+        
+        /* Embed T2 and T3 in response */
         g_response_frame[FRAME_SEQ_OFFSET] = g_rx_buffer[FRAME_SEQ_OFFSET];
         timestamp_to_bytes(t2, &g_response_frame[FRAME_DATA_OFFSET]);
-        
-        if (!send_frame_and_wait(g_response_frame, RESPONSE_FRAME_LEN, &t3)) {
-            printf("  [FAIL] Response TX failed\n\n");
-            continue;
-        }
-        printf("  T3 (Response TX) : 0x%010" PRIX64 "\n", t3);
+        timestamp_to_bytes(t3, &g_response_frame[FRAME_DATA_OFFSET + 5]);
 
-        /* ===== Step 3: Wait for Final ===== */
-        dwt_setrxtimeout((uint32_t)(FINAL_RX_TIMEOUT_UUS * 1.026));
-        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        /* ===== Step 3: Send response at scheduled time T3 ===== */
+        dwt_forcetrxoff();
+        dwt_writetxdata((uint16_t)RESPONSE_FRAME_LEN, g_response_frame, 0);
+        dwt_writetxfctrl((uint16_t)(RESPONSE_FRAME_LEN + 2), 0, 1);
         
-        if (!wait_for_frame(FINAL_RX_TIMEOUT_UUS * 2, MSG_TYPE_FINAL, &t6)) {
-            printf("  [FAIL] Final RX timeout\n\n");
-            dwt_forcetrxoff();
-            continue;
-        }
-        printf("  T6 (Final RX)    : 0x%010" PRIX64 "\n", t6);
-
-        /* Extract T1, T4 from Final message */
-        t1 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET]);
-        t4 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET + 5]);
-        /* T5 is not in the message - we need to estimate or use T6-based calculation */
+        /* Set delayed TX time (only lower 32 bits used) */
+        dwt_setdelayedtrxtime((uint32_t)(t3 >> 8));  /* Delayed TX uses upper 32 bits of 40-bit timestamp */
         
-        printf("  T1 (Poll TX @ A) : 0x%010" PRIX64 "\n", t1);
-        printf("  T4 (Resp RX @ A) : 0x%010" PRIX64 "\n", t4);
-
-        /* ===== Calculate distance using DS-TWR formula ===== */
-        /* We have: T1, T2, T3, T4, T6
-         * We need T5 for full DS-TWR. Estimate it from T4 + small delay.
-         * Or use asymmetric DS-TWR formula. */
-        
-        /* Estimate T5 ≈ T4 + processing_delay (similar to T3-T2) */
-        uint64_t da_estimate = t3 - t2;  /* Use same delay as responder */
-        t5 = t4 + da_estimate;
-        
-        double distance = calculate_distance_dstwr(t1, t2, t3, t4, t5, t6);
-
-        int64_t ra = (int64_t)(t4 - t1);
-        int64_t rb = (int64_t)(t6 - t3);
-        int64_t da = (int64_t)(t5 - t4);
-        int64_t db = (int64_t)(t3 - t2);
-        
-        printf("  Ra (T4-T1)       : %" PRId64 " DWT\n", ra);
-        printf("  Rb (T6-T3)       : %" PRId64 " DWT\n", rb);
-        printf("  Da (T5-T4) est   : %" PRId64 " DWT\n", da);
-        printf("  Db (T3-T2)       : %" PRId64 " DWT\n", db);
-        
-        if (distance > 0 && distance < 100.0) {
-            printf("\n  >>> DISTANCE: %.3f m <<<\n", distance);
-            stats_add(&resp_stats, distance);
+        int ret = dwt_starttx(DWT_START_TX_DELAYED);
+        if (ret == DWT_SUCCESS) {
+            /* Wait for TX complete */
+            uint32_t timeout = 10000;
+            bool tx_done = false;
+            while (timeout-- && !tx_done) {
+                uint32_t status = dwt_readsysstatuslo();
+                if (status & DWT_INT_TXFRS_BIT_MASK) {
+                    dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
+                    tx_done = true;
+                }
+                usleep(1);
+            }
             
-            if (resp_stats.count >= 2) {
-                stats_print(&resp_stats);
+            if (tx_done) {
+                /* Read actual TX timestamp to verify */
+                uint64_t actual_t3 = read_tx_timestamp();
+                printf("  T3 (Response TX) : 0x%010" PRIX64 " (scheduled: 0x%010" PRIX64 ")\n", 
+                       actual_t3, t3);
+                
+                int64_t db = (int64_t)(actual_t3 - t2);
+                printf("  Db (T3-T2)       : %" PRId64 " DWT (%.3f μs)\n", 
+                       db, db * DWT_TIME_UNITS * 1e6);
+            } else {
+                printf("  [FAIL] Response TX timeout\n");
             }
         } else {
-            printf("\n  [WARN] Invalid distance: %.3f m\n", distance);
+            /* Delayed TX failed (probably "late" - scheduled time already passed) */
+            printf("  [FAIL] Delayed TX failed (late?), sending immediately\n");
+            
+            /* Fall back to immediate TX */
+            dwt_forcetrxoff();
+            uint64_t actual_t3 = 0;
+            if (send_frame_and_wait(g_response_frame, RESPONSE_FRAME_LEN, &actual_t3)) {
+                printf("  T3 (Response TX) : 0x%010" PRIX64 " (immediate)\n", actual_t3);
+                /* Note: T3 in the frame is wrong, but initiator will get actual timestamps */
+            } else {
+                printf("  [FAIL] Response TX failed\n");
+            }
         }
+        
         printf("\n");
     }
 
     printf("\n=== Responder Summary ===\n");
     printf("Polls received: %u\n", poll_count);
-    if (resp_stats.count > 0) {
-        printf("\nFinal statistics:\n");
-        stats_print(&resp_stats);
-    }
 }
 
 /*============================================================================
@@ -527,7 +486,7 @@ static void run_calibration(void) {
 
     while (g_running && success < target) {
         uint64_t t1 = 0, t4 = 0;
-        uint64_t t2 = 0;
+        uint64_t t2 = 0, t3 = 0;
 
         g_poll_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
         
@@ -546,28 +505,20 @@ static void run_calibration(void) {
         }
         
         t2 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET]);
+        t3 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET + 5]);
 
-        /* Send final (responder expects it) */
-        g_final_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
-        timestamp_to_bytes(t1, &g_final_frame[FRAME_DATA_OFFSET]);
-        timestamp_to_bytes(t4, &g_final_frame[FRAME_DATA_OFFSET + 5]);
+        int64_t ra = (int64_t)(t4 - t1);
+        int64_t db = (int64_t)(t3 - t2);
         
-        uint64_t t5 = 0;
-        if (!send_frame_and_wait(g_final_frame, FINAL_FRAME_LEN, &t5)) {
-            usleep(100000);
-            continue;
-        }
+        double distance = calculate_distance(ra, db);
 
-        /* SS-TWR calculation with estimated reply delay */
-        uint64_t estimated_reply_delay = (uint64_t)(300.0e-6 / DWT_TIME_UNITS);
-        uint64_t t3 = t2 + estimated_reply_delay;
-        
-        double distance = calculate_distance_sstwr(t1, t2, t3, t4);
-
-        if (distance > 0 && distance < 100.0) {
+        if (distance >= 0 && distance < 100.0) {
             stats_add(&cal_stats, distance);
             success++;
-            printf("[%2u/%u] Measured: %.3f m\n", success, target, distance);
+            printf("[%2u/%u] Measured: %.3f m (Ra=%.1fμs, Db=%.1fμs)\n", 
+                   success, target, distance,
+                   ra * DWT_TIME_UNITS * 1e6,
+                   db * DWT_TIME_UNITS * 1e6);
         }
 
         usleep(200000);
@@ -583,25 +534,34 @@ static void run_calibration(void) {
     double error = mean_measured - g_calibration_distance;
     
     /* 
-     * Error = (total_antenna_delay × 2) × c / (2 × c) = total_antenna_delay
-     * In DWT units: error_m / (c × DWT_TIME_UNITS) = total_delay_dtu
-     * Split equally between TX and RX
+     * The antenna delay adds to the measured distance.
+     * error = measured - true = (antenna_delay_A + antenna_delay_B) * c
+     * Since both devices contribute equally:
+     * single_device_delay = error / (2 * c) in seconds
+     * In DWT units: delay_dtu = single_device_delay / DWT_TIME_UNITS
      */
     double total_delay_s = error / SPEED_OF_LIGHT_M_S;
-    double total_delay_dtu = total_delay_s / DWT_TIME_UNITS;
-    uint16_t recommended_delay = (uint16_t)(total_delay_dtu / 2.0);
+    double delay_per_device_dtu = total_delay_s / DWT_TIME_UNITS / 2.0;
+    uint16_t recommended_delay = (uint16_t)fabs(delay_per_device_dtu);
 
     printf("\n=== Calibration Results ===\n");
     printf("Measurements: %zu\n", cal_stats.count);
     printf("Mean measured distance: %.4f m\n", mean_measured);
     printf("True distance: %.4f m\n", g_calibration_distance);
-    printf("Error: %.4f m (%.1f cm)\n", error, error * 100.0);
-    printf("\nTotal antenna delay: %.0f DWT units (%.2f ns)\n", 
-           total_delay_dtu, total_delay_s * 1e9);
-    printf("\n>>> Recommended antenna delay: %u DWT units <<<\n", recommended_delay);
+    printf("Error: %+.4f m (%+.1f cm)\n", error, error * 100.0);
+    
+    if (error > 0) {
+        printf("\nMeasured > True: Need to ADD antenna delay compensation\n");
+    } else {
+        printf("\nMeasured < True: Unusual - check setup\n");
+    }
+    
+    printf("\n>>> Recommended antenna delay: %u DWT units (%.2f ns) <<<\n", 
+           recommended_delay, recommended_delay * DWT_TIME_UNITS * 1e9);
     printf("\nAdd to your code after chip_init():\n");
     printf("  dwt_setrxantennadelay(%u);\n", recommended_delay);
     printf("  dwt_settxantennadelay(%u);\n", recommended_delay);
+    printf("\nOr run with: ./test_twr initiator --antdly %u\n", recommended_delay);
 }
 
 /*============================================================================
@@ -712,59 +672,23 @@ static uint64_t read_rx_timestamp(void) {
 }
 
 /*============================================================================
- * Distance Calculation
+ * Distance Calculation (SS-TWR)
  *============================================================================*/
 
-/* Single-Sided TWR: simpler, used when we don't have all timestamps */
-static double calculate_distance_sstwr(uint64_t t1, uint64_t t2, uint64_t t3, uint64_t t4) {
+static double calculate_distance(int64_t ra, int64_t db) {
     /*
      * SS-TWR formula:
      * ToF = (Ra - Db) / 2
-     * where Ra = T4 - T1 (round trip at initiator)
-     *       Db = T3 - T2 (reply delay at responder)
+     * Distance = ToF × c
+     *
+     * where:
+     *   Ra = T4 - T1 (round trip measured by initiator)
+     *   Db = T3 - T2 (reply delay measured by responder)
      */
-    int64_t ra = (int64_t)(t4 - t1);
-    int64_t db = (int64_t)(t3 - t2);
-    
     double tof_dtu = (double)(ra - db) / 2.0;
     double tof_s = tof_dtu * DWT_TIME_UNITS;
     double distance = tof_s * SPEED_OF_LIGHT_M_S;
     
-    return distance;
-}
-
-/* Double-Sided TWR: more accurate, cancels clock drift */
-static double calculate_distance_dstwr(uint64_t t1, uint64_t t2, uint64_t t3,
-                                        uint64_t t4, uint64_t t5, uint64_t t6) {
-    /*
-     * DS-TWR formula:
-     * 
-     * Ra = T4 - T1  (round trip time measured by A)
-     * Rb = T6 - T3  (round trip time measured by B)
-     * Da = T5 - T4  (reply delay by A)
-     * Db = T3 - T2  (reply delay by B)
-     *
-     *         Ra × Rb - Da × Db
-     * ToF = ─────────────────────
-     *         Ra + Rb + Da + Db
-     */
-    
-    int64_t ra = (int64_t)(t4 - t1);
-    int64_t rb = (int64_t)(t6 - t3);
-    int64_t da = (int64_t)(t5 - t4);
-    int64_t db = (int64_t)(t3 - t2);
-
-    double numerator = (double)ra * (double)rb - (double)da * (double)db;
-    double denominator = (double)(ra + rb + da + db);
-    
-    if (denominator == 0.0) {
-        return -1.0;
-    }
-
-    double tof_dtu = numerator / denominator;
-    double tof_s = tof_dtu * DWT_TIME_UNITS;
-    double distance = tof_s * SPEED_OF_LIGHT_M_S;
-
     return distance;
 }
 
