@@ -87,7 +87,7 @@
 #define DWT_TIME_UNITS      (1.0 / 499.2e6 / 128.0)  /* ~15.65 ps per DWT unit */
 
 /* Default antenna delay (DWT units) */
-#define DEFAULT_ANT_DLY     16385U  /* ~256ns - typical for DWM3000 */
+#define DEFAULT_ANT_DLY     16381U  /* ~256ns - typical for DWM3000 */
 
 /* Filtering */
 #define FILTER_WINDOW_SIZE      16U
