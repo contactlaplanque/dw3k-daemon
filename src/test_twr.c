@@ -68,7 +68,7 @@
 /* Timing */
 #define RESP_RX_TIMEOUT_UUS         10000U  /* Response RX timeout (μs) - added to reply delay */
 #define REPLY_DELAY_UUS             3000U   /* Responder reply delay (μs) - must match responder */
-#define FINAL_DELAY_UUS             4000U   /* Initiator final TX delay (μs) */
+#define FINAL_DELAY_UUS             2000U   /* Initiator final TX delay (μs) */
 #define RESULT_RX_TIMEOUT_UUS       15000U  /* Initiator wait for result (μs) */
 #define RANGING_INTERVAL_MS         500U    /* Time between ranging exchanges */
 
@@ -77,7 +77,7 @@
 #define DWT_TIME_UNITS      (1.0 / 499.2e6 / 128.0)  /* ~15.65 ps per DWT unit */
 
 /* Default antenna delays (DWT units) - typical for DWM3000 */
-#define DEFAULT_ANT_DLY     16385U
+#define DEFAULT_ANT_DLY     16405U
 
 /* Statistics */
 #define STATS_WINDOW_SIZE   20U
@@ -118,6 +118,30 @@ typedef struct {
     size_t index;
     double sum;
 } avg_filter_t;
+
+typedef enum {
+    DS_EXCHANGE_OK = 0,
+    DS_EXCHANGE_REMOTE_OUTLIER,
+    DS_EXCHANGE_REMOTE_ERROR,
+    DS_EXCHANGE_FAIL_POLL_TX,
+    DS_EXCHANGE_FAIL_RESP_TIMEOUT,
+    DS_EXCHANGE_FAIL_FINAL_SCHED,
+    DS_EXCHANGE_FAIL_FINAL_TX,
+    DS_EXCHANGE_FAIL_RESULT_TIMEOUT
+} ds_exchange_status_t;
+
+typedef struct {
+    uint64_t t1;
+    uint64_t t2;
+    uint64_t t3;
+    uint64_t t4;
+    uint64_t t5_target;
+    uint64_t t5_actual;
+    int64_t t5_drift;
+    double distance_m;
+    uint8_t remote_samples;
+    uint8_t remote_status;
+} ds_measurement_t;
 
 /*============================================================================
  * Global State
@@ -193,6 +217,7 @@ static void run_responder_ss(void);
 static void run_responder_ds(void);
 static void run_responder(void);
 static void run_calibration(void);
+static void run_calibration_ds(void);
 
 static bool send_frame_and_wait(uint8_t *frame, size_t len, uint64_t *tx_ts);
 static bool wait_for_frame(uint32_t timeout_us, uint8_t expected_type, uint64_t *rx_ts);
@@ -203,6 +228,7 @@ static uint64_t read_tx_timestamp(void);
 static uint64_t read_rx_timestamp(void);
 static void int32_to_bytes(int32_t value, uint8_t *bytes);
 static int32_t bytes_to_int32(const uint8_t *bytes);
+static ds_exchange_status_t ds_perform_exchange(ds_measurement_t *meas);
 
 static double calculate_distance(int64_t ra, int64_t db);
 static void stats_add(stats_t *s, double value);
@@ -625,113 +651,24 @@ static void run_initiator_ds(void) {
     avg_filter_t filter;
     filter_reset(&filter);
 
-    const uint64_t final_delay_dtu = (uint64_t)(FINAL_DELAY_UUS * 1e-6 / DWT_TIME_UNITS);
-
     while (g_running) {
         exchange_count++;
         printf("--- Exchange #%u ---\n", exchange_count);
 
-        uint64_t t1 = 0, t4 = 0;
-        uint64_t t2 = 0, t3 = 0;
+        ds_measurement_t meas;
+        ds_exchange_status_t status = ds_perform_exchange(&meas);
 
-        /* Poll */
-        g_poll_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
-        if (!send_frame_and_wait(g_poll_frame, POLL_FRAME_LEN, &t1)) {
-            printf("  [FAIL] Poll TX failed\n\n");
-            fail_count++;
-            usleep(RANGING_INTERVAL_MS * 1000);
-            continue;
-        }
-        printf("  T1 (Poll TX)     : 0x%010" PRIX64 "\n", t1);
-
-        /* Wait for response */
-        uint32_t rx_timeout = (uint32_t)((REPLY_DELAY_UUS + RESP_RX_TIMEOUT_UUS) * 1.05);
-        dwt_setrxtimeout(rx_timeout);
-        dwt_rxenable(DWT_START_RX_IMMEDIATE);
-
-        if (!wait_for_frame(RESP_RX_TIMEOUT_UUS * 2, MSG_TYPE_RESPONSE, &t4)) {
-            printf("  [FAIL] Response RX timeout\n\n");
-            fail_count++;
-            dwt_forcetrxoff();
-            usleep(RANGING_INTERVAL_MS * 1000);
-            continue;
-        }
-
-        printf("  T4 (Response RX) : 0x%010" PRIX64 "\n", t4);
-        t2 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET]);
-        t3 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET + 5]);
-        printf("  T2 (Poll RX @ B) : 0x%010" PRIX64 "\n", t2);
-        printf("  T3 (Resp TX @ B) : 0x%010" PRIX64 "\n", t3);
-
-        /* Schedule final */
-        uint64_t t5_target = t4 + final_delay_dtu;
-        if (t5_target <= t4) {
-            t5_target = t4 + final_delay_dtu;
-        }
-
-        g_final_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
-        timestamp_to_bytes(t1, &g_final_frame[FRAME_DATA_OFFSET]);
-        timestamp_to_bytes(t4, &g_final_frame[FRAME_DATA_OFFSET + 5]);
-        timestamp_to_bytes(t5_target, &g_final_frame[FRAME_DATA_OFFSET + 10]);
-
-        dwt_forcetrxoff();
-        dwt_writetxdata((uint16_t)FINAL_FRAME_LEN, g_final_frame, 0);
-        dwt_writetxfctrl((uint16_t)(FINAL_FRAME_LEN + 2), 0, 1);
-
-        uint64_t dx_target = t5_target - g_ant_dly;
-        uint32_t dx_reg = (uint32_t)(((dx_target >> 8) & 0xFFFFFFFE));
-        dwt_setdelayedtrxtime(dx_reg);
-
-        if (dwt_starttx(DWT_START_TX_DELAYED) != DWT_SUCCESS) {
-            printf("  [FAIL] Final TX scheduling failed\n\n");
-            fail_count++;
-            continue;
-        }
-
-        bool tx_done = false;
-        uint32_t timeout = 50000;
-        while (!tx_done && timeout--) {
-            uint32_t status = dwt_readsysstatuslo();
-            if (status & DWT_INT_TXFRS_BIT_MASK) {
-                dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
-                tx_done = true;
-            } else {
-                usleep(10);
+        if (status == DS_EXCHANGE_OK) {
+            printf("  T1 (Poll TX)     : 0x%010" PRIX64 "\n", meas.t1);
+            printf("  T4 (Response RX) : 0x%010" PRIX64 "\n", meas.t4);
+            printf("  T2 (Poll RX @ B) : 0x%010" PRIX64 "\n", meas.t2);
+            printf("  T3 (Resp TX @ B) : 0x%010" PRIX64 "\n", meas.t3);
+            printf("  T5 (Final TX)    : 0x%010" PRIX64 "\n", meas.t5_actual);
+            if (llabs(meas.t5_drift) > 32) {
+                printf("  [WARN] T5 drift %+lld DWT\n", (long long)meas.t5_drift);
             }
-        }
 
-        if (!tx_done) {
-            printf("  [FAIL] Final TX timeout\n\n");
-            fail_count++;
-            continue;
-        }
-
-        uint64_t t5_actual = read_tx_timestamp();
-        printf("  T5 (Final TX)    : 0x%010" PRIX64 "\n", t5_actual);
-        int64_t t5_drift = (int64_t)(t5_actual - t5_target);
-        if (llabs(t5_drift) > 32) {
-            printf("  [WARN] T5 drift %+lld DWT\n", (long long)t5_drift);
-        }
-
-        /* Wait for result report */
-        dwt_setrxtimeout((uint32_t)(RESULT_RX_TIMEOUT_UUS * 1.05));
-        dwt_rxenable(DWT_START_RX_IMMEDIATE);
-        uint64_t dummy = 0;
-
-        if (!wait_for_frame(RESULT_RX_TIMEOUT_UUS * 2, MSG_TYPE_RESULT, &dummy)) {
-            printf("  [FAIL] Range result timeout\n\n");
-            fail_count++;
-            dwt_forcetrxoff();
-            usleep(RANGING_INTERVAL_MS * 1000);
-            continue;
-        }
-
-        int32_t distance_mm = bytes_to_int32(&g_rx_buffer[FRAME_DATA_OFFSET]);
-        uint8_t status = g_rx_buffer[FRAME_DATA_OFFSET + 4];
-        uint8_t remote_samples = g_rx_buffer[FRAME_DATA_OFFSET + 5];
-        double distance = (double)distance_mm / 1000.0;
-
-        if (status == RESULT_STATUS_OK) {
+            double distance = meas.distance_m;
             bool outlier = filter_is_outlier(&filter, distance, OUTLIER_THRESHOLD_M);
             if (outlier) {
                 printf("  [SKIP] Local filter rejected %.3f m (threshold %.2f m)\n",
@@ -743,7 +680,7 @@ static void run_initiator_ds(void) {
                 double filt_mean = filter_mean(&filter);
 
                 printf("  >>> DISTANCE (DS): %.3f m <<<\n", distance);
-                printf("  Remote samples   : %u\n", remote_samples);
+                printf("  Remote samples   : %u\n", meas.remote_samples);
                 printf("  Filtered avg (n=%zu): %.3f m\n", filter_n, filt_mean);
 
                 stats_add(&g_stats, distance);
@@ -752,12 +689,34 @@ static void run_initiator_ds(void) {
                     stats_print(&g_stats);
                 }
             }
-        } else if (status == RESULT_STATUS_OUTLIER) {
-            printf("  [INFO] Responder marked measurement as outlier (%.3f m)\n", distance);
-            fail_count++;
         } else {
-            printf("  [FAIL] Responder reported invalid exchange\n");
             fail_count++;
+            switch (status) {
+                case DS_EXCHANGE_REMOTE_OUTLIER:
+                    printf("  [INFO] Responder marked measurement as outlier (%.3f m)\n",
+                           meas.distance_m);
+                    break;
+                case DS_EXCHANGE_REMOTE_ERROR:
+                    printf("  [FAIL] Responder reported invalid exchange\n");
+                    break;
+                case DS_EXCHANGE_FAIL_POLL_TX:
+                    printf("  [FAIL] Poll TX failed\n");
+                    break;
+                case DS_EXCHANGE_FAIL_RESP_TIMEOUT:
+                    printf("  [FAIL] Response RX timeout\n");
+                    break;
+                case DS_EXCHANGE_FAIL_FINAL_SCHED:
+                    printf("  [FAIL] Final TX scheduling failed\n");
+                    break;
+                case DS_EXCHANGE_FAIL_FINAL_TX:
+                    printf("  [FAIL] Final TX timeout\n");
+                    break;
+                case DS_EXCHANGE_FAIL_RESULT_TIMEOUT:
+                    printf("  [FAIL] Range result timeout\n");
+                    break;
+                default:
+                    break;
+            }
         }
 
         printf("\n");
@@ -938,6 +897,90 @@ static void run_responder_ds(void) {
     }
 }
 
+static ds_exchange_status_t ds_perform_exchange(ds_measurement_t *meas) {
+    const uint64_t final_delay_dtu = (uint64_t)(FINAL_DELAY_UUS * 1e-6 / DWT_TIME_UNITS);
+
+    memset(meas, 0, sizeof(*meas));
+
+    g_poll_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
+    if (!send_frame_and_wait(g_poll_frame, POLL_FRAME_LEN, &meas->t1)) {
+        return DS_EXCHANGE_FAIL_POLL_TX;
+    }
+
+    uint32_t rx_timeout = (uint32_t)((REPLY_DELAY_UUS + RESP_RX_TIMEOUT_UUS) * 1.05);
+    dwt_setrxtimeout(rx_timeout);
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+    if (!wait_for_frame(RESP_RX_TIMEOUT_UUS * 2, MSG_TYPE_RESPONSE, &meas->t4)) {
+        return DS_EXCHANGE_FAIL_RESP_TIMEOUT;
+    }
+
+    meas->t2 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET]);
+    meas->t3 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET + 5]);
+
+    meas->t5_target = meas->t4 + final_delay_dtu;
+    if (meas->t5_target <= meas->t4) {
+        meas->t5_target = meas->t4 + final_delay_dtu;
+    }
+
+    g_final_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
+    timestamp_to_bytes(meas->t1, &g_final_frame[FRAME_DATA_OFFSET]);
+    timestamp_to_bytes(meas->t4, &g_final_frame[FRAME_DATA_OFFSET + 5]);
+    timestamp_to_bytes(meas->t5_target, &g_final_frame[FRAME_DATA_OFFSET + 10]);
+
+    dwt_forcetrxoff();
+    dwt_writetxdata((uint16_t)FINAL_FRAME_LEN, g_final_frame, 0);
+    dwt_writetxfctrl((uint16_t)(FINAL_FRAME_LEN + 2), 0, 1);
+
+    uint64_t dx_target = meas->t5_target - g_ant_dly;
+    uint32_t dx_reg = (uint32_t)(((dx_target >> 8) & 0xFFFFFFFE));
+    dwt_setdelayedtrxtime(dx_reg);
+
+    if (dwt_starttx(DWT_START_TX_DELAYED) != DWT_SUCCESS) {
+        return DS_EXCHANGE_FAIL_FINAL_SCHED;
+    }
+
+    uint32_t timeout = 50000;
+    bool tx_done = false;
+    while (!tx_done && timeout--) {
+        uint32_t status = dwt_readsysstatuslo();
+        if (status & DWT_INT_TXFRS_BIT_MASK) {
+            dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
+            tx_done = true;
+        } else {
+            usleep(10);
+        }
+    }
+
+    if (!tx_done) {
+        return DS_EXCHANGE_FAIL_FINAL_TX;
+    }
+
+    meas->t5_actual = read_tx_timestamp();
+    meas->t5_drift = (int64_t)(meas->t5_actual - meas->t5_target);
+
+    dwt_setrxtimeout((uint32_t)(RESULT_RX_TIMEOUT_UUS * 1.05));
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    uint64_t dummy = 0;
+
+    if (!wait_for_frame(RESULT_RX_TIMEOUT_UUS * 2, MSG_TYPE_RESULT, &dummy)) {
+        return DS_EXCHANGE_FAIL_RESULT_TIMEOUT;
+    }
+
+    int32_t distance_mm = bytes_to_int32(&g_rx_buffer[FRAME_DATA_OFFSET]);
+    meas->distance_m = (double)distance_mm / 1000.0;
+    meas->remote_status = g_rx_buffer[FRAME_DATA_OFFSET + 4];
+    meas->remote_samples = g_rx_buffer[FRAME_DATA_OFFSET + 5];
+
+    if (meas->remote_status == RESULT_STATUS_OK) {
+        return DS_EXCHANGE_OK;
+    }
+    if (meas->remote_status == RESULT_STATUS_OUTLIER) {
+        return DS_EXCHANGE_REMOTE_OUTLIER;
+    }
+    return DS_EXCHANGE_REMOTE_ERROR;
+}
+
 /*============================================================================
  * Calibration Mode
  *============================================================================*/
@@ -945,8 +988,8 @@ static void run_responder_ds(void) {
 static void run_calibration(void) {
     printf("=== Antenna Delay Calibration ===\n");
     if (g_protocol == PROTO_DS) {
-        printf("NOTE: Calibration currently runs in SS-TWR mode. "
-               "Use '--protocol ss' for consistent results.\n");
+        run_calibration_ds();
+        return;
     }
     printf("True distance: %.3f m\n", g_calibration_distance);
     printf("Using antenna delay: %u DWT (%.2f ns)\n",
@@ -1057,6 +1100,90 @@ static void run_calibration(void) {
     printf("  dwt_setrxantennadelay(%u);\n", recommended_delay);
     printf("  dwt_settxantennadelay(%u);\n", recommended_delay);
     printf("\nOr run with: ./test_twr initiator --antdly %u\n", recommended_delay);
+}
+
+static void run_calibration_ds(void) {
+    printf("True distance: %.3f m\n", g_calibration_distance);
+    printf("Using antenna delay: %u DWT (%.2f ns)\n",
+           g_ant_dly, g_ant_dly * DWT_TIME_UNITS * 1e9);
+    printf("Responder must run in DS mode with matching antenna delay.\n");
+    printf("Running 50 measurements...\n\n");
+
+    stats_t cal_stats = { 0 };
+    avg_filter_t cal_filter;
+    filter_reset(&cal_filter);
+    uint32_t success = 0;
+    const uint32_t target = 50;
+
+    while (g_running && success < target) {
+        ds_measurement_t meas;
+        ds_exchange_status_t status = ds_perform_exchange(&meas);
+
+        if (status == DS_EXCHANGE_OK) {
+            double distance = meas.distance_m;
+            bool outlier = filter_is_outlier(&cal_filter, distance, OUTLIER_THRESHOLD_M);
+            if (outlier) {
+                printf("[--/--] [SKIP] Outlier: %.3f m (window %.2f m)\n",
+                       distance, OUTLIER_THRESHOLD_M);
+            } else {
+                filter_add(&cal_filter, distance);
+                stats_add(&cal_stats, distance);
+                success++;
+                printf("[%2u/%u] Measured: %.3f m (remote n=%u, drift=%+lld DWT)\n",
+                       success, target, distance,
+                       meas.remote_samples,
+                       (long long)meas.t5_drift);
+            }
+        } else if (status == DS_EXCHANGE_REMOTE_OUTLIER) {
+            printf("[--/--] Responder rejected %.3f m as outlier\n", meas.distance_m);
+        } else {
+            printf("[--/--] DS exchange failed (code %d)\n", status);
+        }
+
+        usleep(200000);
+    }
+
+    if (cal_stats.count < 10) {
+        printf("\nERROR: Not enough successful measurements for calibration.\n");
+        return;
+    }
+
+    double mean_measured = cal_stats.sum / (double)cal_stats.count;
+    double error = mean_measured - g_calibration_distance;
+    double delta_dtu = error / (SPEED_OF_LIGHT_M_S * DWT_TIME_UNITS);
+    double recommended_delay_f = (double)g_ant_dly - delta_dtu;
+    if (recommended_delay_f < 0.0) {
+        recommended_delay_f = 0.0;
+    }
+    if (recommended_delay_f > 65535.0) {
+        recommended_delay_f = 65535.0;
+    }
+    uint16_t recommended_delay = (uint16_t)llround(recommended_delay_f);
+    int32_t delta_dly = (int32_t)recommended_delay - (int32_t)g_ant_dly;
+
+    printf("\n=== Calibration Results (DS) ===\n");
+    printf("Measurements: %zu\n", cal_stats.count);
+    printf("Mean measured distance: %.4f m\n", mean_measured);
+    printf("True distance: %.4f m\n", g_calibration_distance);
+    printf("Error: %+.4f m (%+.1f cm)\n", error, error * 100.0);
+
+    if (error > 0) {
+        printf("\nMeasured > True: decrease antenna delay\n");
+    } else if (error < 0) {
+        printf("\nMeasured < True: increase antenna delay\n");
+    } else {
+        printf("\nMeasured equals true distance.\n");
+    }
+
+    printf("\n>>> Recommended antenna delay: %u DWT units (%.2f ns) "
+           "[delta %+d DWT] <<<\n",
+           recommended_delay, recommended_delay * DWT_TIME_UNITS * 1e9,
+           delta_dly);
+    printf("\nAdd to your code after chip_init():\n");
+    printf("  dwt_setrxantennadelay(%u);\n", recommended_delay);
+    printf("  dwt_settxantennadelay(%u);\n", recommended_delay);
+    printf("\nOr run with: ./test_twr initiator --protocol ds --antdly %u\n",
+           recommended_delay);
 }
 
 /*============================================================================
