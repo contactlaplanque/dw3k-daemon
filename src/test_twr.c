@@ -59,7 +59,8 @@
 #define RESPONSE_FRAME_LEN  20U   /* Poll frame + T2(5) + T3(5) */
 
 /* Timing */
-#define RESP_RX_TIMEOUT_UUS         10000U  /* Response RX timeout (μs) */
+#define RESP_RX_TIMEOUT_UUS         10000U  /* Response RX timeout (μs) - added to reply delay */
+#define REPLY_DELAY_UUS             3000U   /* Responder reply delay (μs) - must match responder */
 #define RANGING_INTERVAL_MS         500U    /* Time between ranging exchanges */
 
 /* Speed of light and time unit conversion */
@@ -312,7 +313,9 @@ static void run_initiator(void) {
         printf("  T1 (Poll TX)     : 0x%010" PRIX64 "\n", t1);
 
         /* ===== Step 2: Wait for Response ===== */
-        dwt_setrxtimeout((uint32_t)(RESP_RX_TIMEOUT_UUS * 1.026));
+        /* Timeout = reply delay + margin for TX time + propagation */
+        uint32_t rx_timeout = (uint32_t)((REPLY_DELAY_UUS + RESP_RX_TIMEOUT_UUS) * 1.026);
+        dwt_setrxtimeout(rx_timeout);
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
         
         if (!wait_for_frame(RESP_RX_TIMEOUT_UUS * 2, MSG_TYPE_RESPONSE, &t4)) {
@@ -374,11 +377,14 @@ static void run_initiator(void) {
 /*============================================================================
  * Responder Logic (SS-TWR)
  * 
- * Key: We need to embed T3 (response TX timestamp) in the response.
- * But T3 is only known AFTER we transmit!
+ * The responder needs to send T2 (poll RX timestamp) and T3 (response TX timestamp)
+ * to the initiator. The challenge is that T3 is only known AFTER transmission.
  * 
- * Solution: Use "delayed response" - we schedule the TX at a fixed future time,
- * so we know T3 before we send.
+ * Solution: Use delayed TX with a generous delay to ensure we have time to:
+ * 1. Read T2
+ * 2. Compute T3 = T2 + delay
+ * 3. Write the frame with T2 and T3 embedded
+ * 4. Start delayed TX before T3 arrives
  *============================================================================*/
 
 static void run_responder(void) {
@@ -386,11 +392,25 @@ static void run_responder(void) {
     
     uint32_t poll_count = 0;
 
-    /* Fixed reply delay in DWT units (~500 μs) */
-    const uint64_t REPLY_DELAY_DTU = (uint64_t)(500.0e-6 / DWT_TIME_UNITS);
+    /* 
+     * Reply delay in DWT units.
+     * Must be long enough for:
+     * - Reading RX timestamp (~10μs)
+     * - Computing and writing response frame (~100μs)  
+     * - SPI transfers (~50μs)
+     * - Safety margin
+     * 
+     * 3ms is very conservative but guarantees success.
+     */
+    const uint64_t REPLY_DELAY_UUS = 3000;  /* 3ms in microseconds */
+    const uint64_t REPLY_DELAY_DTU = (uint64_t)(REPLY_DELAY_UUS * 1e-6 / DWT_TIME_UNITS);
+    
+    printf("Reply delay: %llu μs (%llu DWT units)\n\n", 
+           (unsigned long long)REPLY_DELAY_UUS, 
+           (unsigned long long)REPLY_DELAY_DTU);
     
     while (g_running) {
-        uint64_t t2 = 0, t3 = 0;
+        uint64_t t2 = 0, t3_scheduled = 0;
 
         /* ===== Step 1: Wait for Poll ===== */
         dwt_forcetrxoff();
@@ -405,27 +425,32 @@ static void run_responder(void) {
         printf("--- Poll #%u received ---\n", poll_count);
         printf("  T2 (Poll RX)     : 0x%010" PRIX64 "\n", t2);
 
-        /* ===== Step 2: Calculate T3 and prepare response ===== */
+        /* ===== Step 2: Calculate scheduled T3 and prepare response ===== */
         /* Schedule TX at T2 + REPLY_DELAY */
-        t3 = t2 + REPLY_DELAY_DTU;
+        t3_scheduled = t2 + REPLY_DELAY_DTU;
         
         /* Embed T2 and T3 in response */
         g_response_frame[FRAME_SEQ_OFFSET] = g_rx_buffer[FRAME_SEQ_OFFSET];
         timestamp_to_bytes(t2, &g_response_frame[FRAME_DATA_OFFSET]);
-        timestamp_to_bytes(t3, &g_response_frame[FRAME_DATA_OFFSET + 5]);
+        timestamp_to_bytes(t3_scheduled, &g_response_frame[FRAME_DATA_OFFSET + 5]);
 
         /* ===== Step 3: Send response at scheduled time T3 ===== */
         dwt_forcetrxoff();
         dwt_writetxdata((uint16_t)RESPONSE_FRAME_LEN, g_response_frame, 0);
         dwt_writetxfctrl((uint16_t)(RESPONSE_FRAME_LEN + 2), 0, 1);
         
-        /* Set delayed TX time (only lower 32 bits used) */
-        dwt_setdelayedtrxtime((uint32_t)(t3 >> 8));  /* Delayed TX uses upper 32 bits of 40-bit timestamp */
+        /* 
+         * Set delayed TX time. 
+         * The DW3000 uses bits [8:39] of the 40-bit timestamp for delayed TX.
+         * So we shift right by 8 to get the 32-bit value to write.
+         */
+        uint32_t tx_time = (uint32_t)((t3_scheduled >> 8) & 0xFFFFFFFE);  /* Must be even */
+        dwt_setdelayedtrxtime(tx_time);
         
         int ret = dwt_starttx(DWT_START_TX_DELAYED);
         if (ret == DWT_SUCCESS) {
             /* Wait for TX complete */
-            uint32_t timeout = 10000;
+            uint32_t timeout = 50000;  /* 50ms max wait */
             bool tx_done = false;
             while (timeout-- && !tx_done) {
                 uint32_t status = dwt_readsysstatuslo();
@@ -433,34 +458,32 @@ static void run_responder(void) {
                     dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
                     tx_done = true;
                 }
-                usleep(1);
+                usleep(10);
             }
             
             if (tx_done) {
                 /* Read actual TX timestamp to verify */
                 uint64_t actual_t3 = read_tx_timestamp();
-                printf("  T3 (Response TX) : 0x%010" PRIX64 " (scheduled: 0x%010" PRIX64 ")\n", 
-                       actual_t3, t3);
-                
                 int64_t db = (int64_t)(actual_t3 - t2);
+                
+                printf("  T3 (Response TX) : 0x%010" PRIX64 "\n", actual_t3);
                 printf("  Db (T3-T2)       : %" PRId64 " DWT (%.3f μs)\n", 
                        db, db * DWT_TIME_UNITS * 1e6);
+                
+                /* Check if actual matches scheduled (within 1 DWT unit = ~15ps) */
+                int64_t diff = (int64_t)(actual_t3 - t3_scheduled);
+                if (diff < -10 || diff > 10) {
+                    printf("  [WARN] T3 drift: %+" PRId64 " DWT from scheduled\n", diff);
+                }
             } else {
-                printf("  [FAIL] Response TX timeout\n");
+                printf("  [FAIL] Response TX timeout (no TXFRS)\n");
             }
         } else {
-            /* Delayed TX failed (probably "late" - scheduled time already passed) */
-            printf("  [FAIL] Delayed TX failed (late?), sending immediately\n");
+            /* Delayed TX failed - scheduled time already passed */
+            printf("  [FAIL] Delayed TX late! Processing took too long.\n");
+            printf("  Scheduled T3: 0x%010" PRIX64 "\n", t3_scheduled);
             
-            /* Fall back to immediate TX */
-            dwt_forcetrxoff();
-            uint64_t actual_t3 = 0;
-            if (send_frame_and_wait(g_response_frame, RESPONSE_FRAME_LEN, &actual_t3)) {
-                printf("  T3 (Response TX) : 0x%010" PRIX64 " (immediate)\n", actual_t3);
-                /* Note: T3 in the frame is wrong, but initiator will get actual timestamps */
-            } else {
-                printf("  [FAIL] Response TX failed\n");
-            }
+            /* Don't send - the initiator will timeout and retry */
         }
         
         printf("\n");
