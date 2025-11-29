@@ -43,3 +43,6 @@ target_link_libraries(test_beacon PRIVATE dw3k_core)
 add_executable(test_twr src/test_twr.c)
 target_link_libraries(test_twr PRIVATE dw3k_core m)  # 'm' for math library (sqrt)
 
+add_executable(twr_measure src/twr_measure.c)
+target_link_libraries(twr_measure PRIVATE dw3k_core m)  # 'm' for math library (sqrt)
+
