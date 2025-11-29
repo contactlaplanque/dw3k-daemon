@@ -28,7 +28,6 @@ int spi_init(const char *device, unsigned int speed_hz) {
     ioctl(spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bits);
     ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed_hz);
     
-    printf("[SPI] Initialized at %u Hz\n", speed_hz);
     return 0;
 }
 
