@@ -115,6 +115,54 @@ static uint8_t g_stop_frame[STOP_FRAME_LEN];
  * Helper Functions
  *============================================================================*/
 
+/* Convert carrier integrator reading to ppm clock offset on channel 9.
+ * Positive ppm means local RX clock is slower than remote TX (per API doc). */
+static double read_ppm_from_carrier_integrator_ch9(void) {
+    int32_t ci = dwt_readcarrierintegrator();
+    double freq_hz = (double)ci * FREQ_OFFSET_MULTIPLIER;
+    double ppm = freq_hz * HERTZ_TO_PPM_MULTIPLIER_CHAN_9;
+    return ppm;
+}
+
+/* Compute scaling ratio to convert responder times into initiator timebase */
+static double clock_ratio_from_ppm(double ppm) {
+    return 1.0 + (ppm * 1e-6);
+}
+
+/* Simple piecewise-linear bias table vs RSL (dBm). Values are placeholders;
+ * tune with empirical calibration for your setup. */
+typedef struct {
+    double rssi_dbm;
+    double bias_m;
+} rsl_bias_point_t;
+
+static const rsl_bias_point_t k_rsl_bias_table[] = {
+    { -95.0, 0.000 },
+    { -85.0, 0.000 },
+    { -80.0, 0.005 },
+    { -75.0, 0.010 },
+    { -70.0, 0.020 },
+    { -65.0, 0.030 },
+};
+
+static double estimate_range_bias_from_rssi(double rssi_dbm) {
+    const size_t n = sizeof(k_rsl_bias_table) / sizeof(k_rsl_bias_table[0]);
+    if (n == 0) return 0.0;
+    if (rssi_dbm <= k_rsl_bias_table[0].rssi_dbm) return k_rsl_bias_table[0].bias_m;
+    if (rssi_dbm >= k_rsl_bias_table[n - 1].rssi_dbm) return k_rsl_bias_table[n - 1].bias_m;
+    for (size_t i = 1; i < n; i++) {
+        if (rssi_dbm < k_rsl_bias_table[i].rssi_dbm) {
+            double x0 = k_rsl_bias_table[i - 1].rssi_dbm;
+            double y0 = k_rsl_bias_table[i - 1].bias_m;
+            double x1 = k_rsl_bias_table[i].rssi_dbm;
+            double y1 = k_rsl_bias_table[i].bias_m;
+            double t = (rssi_dbm - x0) / (x1 - x0);
+            return y0 + t * (y1 - y0);
+        }
+    }
+    return 0.0;
+}
+
 static void timestamp_to_bytes(uint64_t ts, uint8_t *bytes) {
     for (int i = 0; i < 5; i++) {
         bytes[i] = (uint8_t)(ts >> (i * 8));
@@ -529,6 +577,7 @@ static int run_responder(uint32_t expected_polls) {
     while (true) {
         uint64_t t2 = 0, t3 = 0, t6 = 0;
         uint64_t t1 = 0, t4 = 0, t5 = 0;
+        double ppm_on_poll = 0.0, ppm_on_final = 0.0;
 
         /* [1] Wait for POLL */
         dwt_forcetrxoff();
@@ -565,6 +614,9 @@ static int run_responder(uint32_t expected_polls) {
             /* Ignore unexpected frames */
             continue;
         }
+
+        /* CFO estimate from initiator (from POLL) */
+        ppm_on_poll = read_ppm_from_carrier_integrator_ch9();
 
         if (!first_poll_received) {
             printf("Polling received. Measurement started.\n");
@@ -604,6 +656,9 @@ static int run_responder(uint32_t expected_polls) {
             continue;
         }
 
+        /* CFO estimate from initiator (from FINAL) */
+        ppm_on_final = read_ppm_from_carrier_integrator_ch9();
+
         /* [4] Wait for REPORT - immediately re-enable RX after FINAL */
         dwt_writesysstatuslo(SYS_STATUS_ALL_RX_GOOD | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_TO);
         dwt_setrxtimeout(RX_TIMEOUT_UUS);
@@ -628,7 +683,7 @@ static int run_responder(uint32_t expected_polls) {
         t4 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET + 5]);
         t5 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET + 10]);
 
-        /* Calculate DS-TWR distance */
+        /* Calculate DS-TWR distance with CFO correction */
         int64_t ra = (int64_t)(t4 - t1);
         int64_t rb = (int64_t)(t6 - t3);
         int64_t da = (int64_t)(t5 - t4);
@@ -638,14 +693,43 @@ static int run_responder(uint32_t expected_polls) {
         uint8_t status = RESULT_STATUS_ERROR;
 
         if (ra > 0 && rb > 0 && da > 0 && db > 0) {
-            double num = (double)ra * (double)rb - (double)da * (double)db;
-            double den = (double)ra + (double)rb + (double)da + (double)db;
+            /* Convert responder-measured intervals to initiator timebase using averaged ppm */
+            double avg_ppm = (ppm_on_poll + ppm_on_final) * 0.5;
+            double ratio = clock_ratio_from_ppm(avg_ppm);
+            double rb_corr = (double)rb * ratio;
+            double db_corr = (double)db * ratio;
+
+            double num = (double)ra * rb_corr - (double)da * db_corr;
+            double den = (double)ra + rb_corr + (double)da + db_corr;
 
             if (den > 0.0 && num >= 0.0) {
                 double tof = num / den;
                 distance = tof * DWT_TIME_UNITS * SPEED_OF_LIGHT_M_S;
                 if (distance >= 0.0 && distance < 200.0) {
                     status = RESULT_STATUS_OK;
+                }
+            }
+        }
+
+        /* Multipath/NLOS gating and RSL-based bias compensation (use diagnostics from FINAL) */
+        if (status == RESULT_STATUS_OK) {
+            dwt_cirdiags_t diag = { 0 };
+            if (dwt_readdiagnostics_acc(&diag, DWT_ACC_IDX_IP_M) == DWT_SUCCESS) {
+                int16_t rssi_q8 = 0;
+                int16_t fp_q8 = 0;
+                if (dwt_calculate_rssi(&diag, DWT_ACC_IDX_IP_M, &rssi_q8) == DWT_SUCCESS &&
+                    dwt_calculate_first_path_power(&diag, DWT_ACC_IDX_IP_M, &fp_q8) == DWT_SUCCESS) {
+                    double rssi_dbm = (double)rssi_q8 / 256.0;
+                    double fp_dbm = (double)fp_q8 / 256.0;
+                    double diff_db = rssi_dbm - fp_dbm;
+                    /* Gate out heavy multipath where first path is much weaker than total */
+                    if (diff_db > 12.0) {
+                        status = RESULT_STATUS_OUTLIER;
+                    } else {
+                        /* Apply small bias correction vs RSL */
+                        double bias_m = estimate_range_bias_from_rssi(rssi_dbm);
+                        distance -= bias_m;
+                    }
                 }
             }
         }

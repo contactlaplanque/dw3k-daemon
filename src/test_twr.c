@@ -191,6 +191,49 @@ static void signal_handler(int sig) {
     g_running = 0;
 }
 
+/* Convert carrier integrator to ppm (channel 9) */
+static double read_ppm_from_carrier_integrator_ch9(void) {
+    int32_t ci = dwt_readcarrierintegrator();
+    double freq_hz = (double)ci * FREQ_OFFSET_MULTIPLIER;
+    return freq_hz * HERTZ_TO_PPM_MULTIPLIER_CHAN_9;
+}
+
+static double clock_ratio_from_ppm(double ppm) {
+    return 1.0 + (ppm * 1e-6);
+}
+
+typedef struct {
+    double rssi_dbm;
+    double bias_m;
+} rsl_bias_point_t;
+
+static const rsl_bias_point_t k_rsl_bias_table[] = {
+    { -95.0, 0.000 },
+    { -85.0, 0.000 },
+    { -80.0, 0.005 },
+    { -75.0, 0.010 },
+    { -70.0, 0.020 },
+    { -65.0, 0.030 },
+};
+
+static double estimate_range_bias_from_rssi(double rssi_dbm) {
+    const size_t n = sizeof(k_rsl_bias_table) / sizeof(k_rsl_bias_table[0]);
+    if (n == 0) return 0.0;
+    if (rssi_dbm <= k_rsl_bias_table[0].rssi_dbm) return k_rsl_bias_table[0].bias_m;
+    if (rssi_dbm >= k_rsl_bias_table[n - 1].rssi_dbm) return k_rsl_bias_table[n - 1].bias_m;
+    for (size_t i = 1; i < n; i++) {
+        if (rssi_dbm < k_rsl_bias_table[i].rssi_dbm) {
+            double x0 = k_rsl_bias_table[i - 1].rssi_dbm;
+            double y0 = k_rsl_bias_table[i - 1].bias_m;
+            double x1 = k_rsl_bias_table[i].rssi_dbm;
+            double y1 = k_rsl_bias_table[i].bias_m;
+            double t = (rssi_dbm - x0) / (x1 - x0);
+            return y0 + t * (y1 - y0);
+        }
+    }
+    return 0.0;
+}
+
 static void timestamp_to_bytes(uint64_t ts, uint8_t *bytes) {
     for (int i = 0; i < 5; i++) {
         bytes[i] = (uint8_t)(ts >> (i * 8));
@@ -485,6 +528,7 @@ static void run_responder(void) {
     while (g_running) {
         uint64_t t2 = 0, t3 = 0, t6 = 0;
         uint64_t t1 = 0, t4 = 0, t5 = 0;
+        double ppm_on_poll = 0.0, ppm_on_final = 0.0;
 
         /* [1] Wait for POLL */
         dwt_forcetrxoff();
@@ -498,6 +542,9 @@ static void run_responder(void) {
         poll_count++;
         printf("--- Poll #%u ---\n", poll_count);
         printf("  T2=0x%010" PRIX64 "\n", t2);
+
+        /* CFO estimate from initiator (from POLL) */
+        ppm_on_poll = read_ppm_from_carrier_integrator_ch9();
 
         /* [2] Send RESPONSE, auto-enable RX for Final */
         g_response_frame[FRAME_SEQ_OFFSET] = g_rx_buffer[FRAME_SEQ_OFFSET];
@@ -523,6 +570,9 @@ static void run_responder(void) {
             continue;
         }
         printf("  T6=0x%010" PRIX64 "\n", t6);
+
+        /* CFO estimate from initiator (from FINAL) */
+        ppm_on_final = read_ppm_from_carrier_integrator_ch9();
 
         /* [4] Wait for REPORT - immediately re-enable RX after FINAL */
         /* Note: wait_for_frame leaves RX disabled after successful reception */
@@ -555,7 +605,7 @@ static void run_responder(void) {
         t5 = bytes_to_timestamp(&g_rx_buffer[FRAME_DATA_OFFSET + 10]);
         printf("  T1=0x%010" PRIX64 " T4=0x%010" PRIX64 " T5=0x%010" PRIX64 "\n", t1, t4, t5);
 
-        /* Calculate DS-TWR distance */
+        /* Calculate DS-TWR distance with CFO correction */
         int64_t ra = (int64_t)(t4 - t1);
         int64_t rb = (int64_t)(t6 - t3);
         int64_t da = (int64_t)(t5 - t4);
@@ -565,14 +615,40 @@ static void run_responder(void) {
         uint8_t status = RESULT_STATUS_ERROR;
 
         if (ra > 0 && rb > 0 && da > 0 && db > 0) {
-            double num = (double)ra * (double)rb - (double)da * (double)db;
-            double den = (double)ra + (double)rb + (double)da + (double)db;
+            double avg_ppm = (ppm_on_poll + ppm_on_final) * 0.5;
+            double ratio = clock_ratio_from_ppm(avg_ppm);
+            double rb_corr = (double)rb * ratio;
+            double db_corr = (double)db * ratio;
+
+            double num = (double)ra * rb_corr - (double)da * db_corr;
+            double den = (double)ra + rb_corr + (double)da + db_corr;
 
             if (den > 0.0 && num >= 0.0) {
                 double tof = num / den;
                 distance = tof * DWT_TIME_UNITS * SPEED_OF_LIGHT_M_S;
                 if (distance >= 0.0 && distance < 200.0) {
                     status = RESULT_STATUS_OK;
+                }
+            }
+        }
+
+        /* Multipath/NLOS gating and RSL-based bias compensation (use diagnostics from FINAL) */
+        if (status == RESULT_STATUS_OK) {
+            dwt_cirdiags_t diag = { 0 };
+            if (dwt_readdiagnostics_acc(&diag, DWT_ACC_IDX_IP_M) == DWT_SUCCESS) {
+                int16_t rssi_q8 = 0;
+                int16_t fp_q8 = 0;
+                if (dwt_calculate_rssi(&diag, DWT_ACC_IDX_IP_M, &rssi_q8) == DWT_SUCCESS &&
+                    dwt_calculate_first_path_power(&diag, DWT_ACC_IDX_IP_M, &fp_q8) == DWT_SUCCESS) {
+                    double rssi_dbm = (double)rssi_q8 / 256.0;
+                    double fp_dbm = (double)fp_q8 / 256.0;
+                    double diff_db = rssi_dbm - fp_dbm;
+                    if (diff_db > 12.0) {
+                        status = RESULT_STATUS_OUTLIER;
+                    } else {
+                        double bias_m = estimate_range_bias_from_rssi(rssi_dbm);
+                        distance -= bias_m;
+                    }
                 }
             }
         }

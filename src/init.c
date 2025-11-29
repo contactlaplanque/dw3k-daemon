@@ -90,8 +90,8 @@ int chip_init(void) {
     // 5. Configure for operation
     printf("Configuring device...\n");
     dwt_config_t config = {
-        .chan = 9,                  // Channel 9 (less crowded, may reduce RF interference)
-        .txPreambLength = DWT_PLEN_128,
+        .chan = 9,                  // Channel 9
+        .txPreambLength = DWT_PLEN_256,
         .rxPAC = DWT_PAC8,
         .txCode = 10,               // Preamble code 10 for Channel 9
         .rxCode = 10,               // Preamble code 10 for Channel 9
@@ -99,9 +99,9 @@ int chip_init(void) {
         .dataRate = DWT_BR_6M8,
         .phrMode = DWT_PHRMODE_STD,
         .phrRate = DWT_PHRRATE_STD,
-        .sfdTO = (uint16_t)(128 + 1 + DWT_SFD_LEN8 - 8),
-        .stsMode = DWT_STS_MODE_OFF,
-        .stsLength = 0,
+        .sfdTO = (uint16_t)(256 + 1 + DWT_SFD_LEN8 - 8),
+        .stsMode = DWT_STS_MODE_1,
+        .stsLength = DWT_STS_LEN_64,
         .pdoaMode = DWT_PDOA_M0,
     };
 
@@ -110,6 +110,12 @@ int chip_init(void) {
         return -1;
     }
     printf("Device configured\n");
+
+    /* Enable fine-grain TX sequencer for consistent TX timing */
+    dwt_setfinegraintxseq(1);
+
+    /* Enable CIA diagnostics so RSL/FP power calculations are available */
+    dwt_configciadiag(DW_CIA_DIAG_LOG_ALL);
 
     // 6. Set addresses
     dwt_setpanid(0xDECA);
