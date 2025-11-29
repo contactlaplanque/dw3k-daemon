@@ -68,7 +68,7 @@
 #define DWT_TIME_UNITS      (1.0 / 499.2e6 / 128.0)
 
 /* Default antenna delay (DWT units) */
-#define DEFAULT_ANT_DLY     16381U
+#define DEFAULT_ANT_DLY     16365U
 
 /* Filtering - use dynamic allocation to handle any measurement count */
 #define MAX_MEASUREMENTS        1000U  /* Maximum samples we can handle */
