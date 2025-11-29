@@ -1,12 +1,7 @@
 /*
- * twr_measure.c – Production DS-TWR distance measurement
- *
- * Usage:
- *   ./twr_measure initiator <initiator_id> <responder_id> <num_measurements>
- *   ./twr_measure responder <responder_id> <initiator_id>
- *
- * This program performs N fast distance measurements and exits with statistics.
- * Minimal output - designed for programmatic use.
+ * DS-TWR service layer shared by dw3k-daemon. It exposes role-agnostic
+ * helpers so the daemon can switch between initiator/responder modes without
+ * recompiling dedicated test binaries.
  */
 
 #include <inttypes.h>
@@ -15,17 +10,16 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "deca_device_api.h"
-#include "init.h"
+#include "twr_service.h"
 
 /*============================================================================
  * Constants
  *============================================================================*/
-
-#define PAN_ID              0xDECAU
 
 /* Message types */
 #define MSG_TYPE_POLL       0x21U
@@ -93,15 +87,63 @@ typedef struct {
     size_t capacity;
 } measurement_buffer_t;
 
+static void init_frames(role_t role);
+static void configure_device(role_t role);
+
 /*============================================================================
  * Global State
  *============================================================================*/
 
 static uint8_t g_rx_buffer[RX_BUFFER_LEN];
 static uint8_t g_seq_num = 0;
-static uint16_t g_ant_dly = DEFAULT_ANT_DLY;
-static uint16_t g_initiator_id = 0;
-static uint16_t g_responder_id = 0;
+static twr_service_config_t g_service_cfg = {
+    .pan_id = 0xDECAu,
+    .local_id = 0,
+    .peer_id = 0,
+    .antenna_delay = DEFAULT_ANT_DLY,
+};
+
+static bool g_log_enabled = false;
+static role_t g_active_role = ROLE_INITIATOR;
+
+void twr_service_set_logging(bool enable) {
+    g_log_enabled = enable;
+}
+
+static void twr_log(bool force, const char *fmt, ...) {
+    if (!g_log_enabled && !force) {
+        return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+}
+
+#define LOG_INFO(...) twr_log(false, __VA_ARGS__)
+#define LOG_WARN(...) twr_log(true, __VA_ARGS__)
+
+void twr_service_set_config(const twr_service_config_t *cfg) {
+    if (!cfg) {
+        return;
+    }
+    g_service_cfg = *cfg;
+    g_seq_num = 0;
+}
+
+void twr_service_get_config(twr_service_config_t *cfg) {
+    if (!cfg) {
+        return;
+    }
+    *cfg = g_service_cfg;
+}
+
+void twr_service_prepare_frames(twr_role_t role) {
+    role_t internal_role = (role == TWR_ROLE_RESPONDER) ? ROLE_RESPONDER : ROLE_INITIATOR;
+    g_active_role = internal_role;
+    init_frames(internal_role);
+    configure_device(internal_role);
+}
 
 /* Frame templates (will be populated with actual addresses) */
 static uint8_t g_poll_frame[POLL_FRAME_LEN];
@@ -351,9 +393,8 @@ static bool wait_for_frame(uint8_t expected_type, uint64_t *rx_ts, uint8_t *rece
                                        frame_type == MSG_TYPE_FINAL ||
                                        frame_type == MSG_TYPE_REPORT ||
                                        frame_type == MSG_TYPE_STOP);
-                uint16_t expected_id = from_initiator ? g_initiator_id : g_responder_id;
-
-                if (src_addr == expected_id) {
+                uint16_t expected_id = g_service_cfg.peer_id;
+                if (expected_id == 0 || src_addr == expected_id) {
                     if (received_type) {
                         *received_type = frame_type;
                     }
@@ -384,7 +425,7 @@ static void reset_rx_state(void) {
 static void send_stop_signal(void) {
     g_stop_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
     if (!send_frame(g_stop_frame, STOP_FRAME_LEN, NULL, false)) {
-        fprintf(stderr, "WARN: failed to send STOP frame\n");
+        LOG_WARN("WARN: failed to send STOP frame\n");
     }
 }
 
@@ -392,9 +433,8 @@ static void send_stop_signal(void) {
  * DS-TWR Initiator
  *============================================================================*/
 
-static int run_initiator(uint32_t num_measurements) {
-    printf("Running measurement: %u samples\n", num_measurements);
-    fflush(stdout);
+int twr_service_run_initiator(uint32_t num_measurements, twr_measurement_stats_t *stats) {
+    LOG_INFO("Starting TWR initiator run: %u samples\n", num_measurements);
     
     uint32_t exchange_count = 0;
     uint32_t success_count = 0;
@@ -408,14 +448,7 @@ static int run_initiator(uint32_t num_measurements) {
     while (exchange_count < num_measurements) {
         exchange_count++;
         
-        /* Log progress every 10 measurements */
-        if (exchange_count % 10 == 0 || exchange_count == 1 || exchange_count == num_measurements) {
-            printf("Progress: %u/%u (success: %u)\n", exchange_count, num_measurements, success_count);
-            fflush(stdout);
-        }
-
         uint64_t t1 = 0, t4 = 0, t5 = 0;
-        const char *fail_reason = NULL;
 
         /* [1] Send POLL and wait for RESPONSE (with retries) */
         {
@@ -424,14 +457,12 @@ static int run_initiator(uint32_t num_measurements) {
                 g_poll_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
                 dwt_setrxtimeout(RX_TIMEOUT_UUS);
                 if (!send_frame(g_poll_frame, POLL_FRAME_LEN, &t1, true)) {
-                    fail_reason = "Poll TX failed";
                     continue;
                 }
                 if (wait_for_frame(MSG_TYPE_RESPONSE, &t4, NULL, DEFAULT_WAIT_TIMEOUT_US)) {
                     response_ok = true;
                     break;
                 }
-                fail_reason = "Response timeout";
                 reset_rx_state();
             }
             if (!response_ok) {
@@ -464,14 +495,12 @@ static int run_initiator(uint32_t num_measurements) {
                 timestamp_to_bytes(t5, &g_report_frame[FRAME_DATA_OFFSET + 10]);
                 dwt_setrxtimeout(RX_TIMEOUT_UUS);
                 if (!send_frame(g_report_frame, REPORT_FRAME_LEN, NULL, true)) {
-                    fail_reason = "Report TX failed";
                     continue;
                 }
                 if (wait_for_frame(MSG_TYPE_RESULT, NULL, NULL, DEFAULT_WAIT_TIMEOUT_US)) {
                     result_ok = true;
                     break;
                 }
-                fail_reason = "Result timeout";
                 reset_rx_state();
             }
             if (!result_ok) {
@@ -519,57 +548,59 @@ static int run_initiator(uint32_t num_measurements) {
         size_t filtered_count = robust_filter(raw_distances, raw_count, filtered_distances, max_samples);
         
         /* Calculate filtered statistics */
-        double filt_mean = calculate_mean(filtered_distances, filtered_count);
-        double filt_stddev = calculate_stddev(filtered_distances, filtered_count, filt_mean);
-        double filt_median = calculate_median(filtered_distances, filtered_count);
-        double filt_min = filtered_distances[0], filt_max = filtered_distances[0];
+        double filt_mean = (filtered_count > 0) ? calculate_mean(filtered_distances, filtered_count) : 0.0;
+        double filt_stddev = (filtered_count > 0) ? calculate_stddev(filtered_distances, filtered_count, filt_mean) : 0.0;
+        double filt_median = (filtered_count > 0) ? calculate_median(filtered_distances, filtered_count) : 0.0;
+        double filt_min = (filtered_count > 0) ? filtered_distances[0] : 0.0;
+        double filt_max = (filtered_count > 0) ? filtered_distances[0] : 0.0;
         for (size_t i = 1; i < filtered_count; i++) {
             if (filtered_distances[i] < filt_min) filt_min = filtered_distances[i];
             if (filtered_distances[i] > filt_max) filt_max = filtered_distances[i];
         }
         
-        printf("\n=== RAW MEASUREMENTS (all successful) ===\n");
-        printf("Count: %zu | Mean: %.3f m | Median: %.3f m | Stddev: %.3f m\n",
-               raw_count, raw_mean, raw_median, raw_stddev);
-        printf("Range: [%.3f, %.3f] m\n", raw_min, raw_max);
-        
-        printf("\n=== FILTERED MEASUREMENTS (robust 3-sigma filtering) ===\n");
-        printf("Count: %zu | Mean: %.3f m | Median: %.3f m | Stddev: %.3f m\n",
-               filtered_count, filt_mean, filt_median, filt_stddev);
-        printf("Range: [%.3f, %.3f] m\n", filt_min, filt_max);
-        
-        printf("\nCompleted %u attempts. Successes: %u. Filtered: %zu. Rejected: %zu (%.1f%%)\n",
-               exchange_count, success_count, filtered_count, 
-               raw_count - filtered_count,
-               100.0 * (raw_count - filtered_count) / raw_count);
-        
-        /* CSV output: mean,stddev,min,max,median,filtered_count,total_attempts */
-        printf("\nCSV: %.3f,%.3f,%.3f,%.3f,%.3f,%zu,%u\n",
-               filt_mean, filt_stddev, filt_min, filt_max, filt_median,
-               filtered_count, exchange_count);
+        if (stats) {
+            stats->attempts = exchange_count;
+            stats->successes = success_count;
+            stats->raw_count = raw_count;
+            stats->filtered_count = filtered_count;
+            stats->rejected_count = raw_count - filtered_count;
+            stats->raw_mean = raw_mean;
+            stats->raw_stddev = raw_stddev;
+            stats->raw_min = raw_min;
+            stats->raw_max = raw_max;
+            stats->raw_median = raw_median;
+            stats->filtered_mean = filt_mean;
+            stats->filtered_stddev = filt_stddev;
+            stats->filtered_min = filt_min;
+            stats->filtered_max = filt_max;
+            stats->filtered_median = filt_median;
+        }
         
         free(raw_distances);
         free(filtered_distances);
         return 0;
-    } else {
-        fprintf(stderr, "ERROR: No successful measurements\n");
-        free(raw_distances);
-        free(filtered_distances);
-        return 1;
     }
+
+    LOG_WARN("ERROR: No successful measurements\n");
+    if (stats) {
+        memset(stats, 0, sizeof(*stats));
+        stats->attempts = exchange_count;
+    }
+    free(raw_distances);
+    free(filtered_distances);
+    return 1;
 }
 
 /*============================================================================
  * DS-TWR Responder
  *============================================================================*/
 
-static int run_responder(uint32_t expected_polls) {
+int twr_service_run_responder(uint32_t expected_polls) {
     if (expected_polls > 0) {
-        printf("Waiting for %u polls...\n", expected_polls);
+        LOG_INFO("Waiting for %u polls...\n", expected_polls);
     } else {
-        printf("Waiting for polls...\n");
+        LOG_INFO("Waiting for polls...\n");
     }
-    fflush(stdout);
     
     uint32_t poll_count = 0;
     bool first_poll_received = false;
@@ -597,16 +628,14 @@ static int run_responder(uint32_t expected_polls) {
                             &t2, &frame_type, poll_timeout)) {
             /* Timeout after first poll means initiator is done */
             if (first_poll_received) {
-                printf("Measurement complete. Total polls: %u\n", poll_count);
-                fflush(stdout);
+                LOG_INFO("Measurement complete. Total polls: %u\n", poll_count);
                 break;
             }
             continue;
         }
 
         if (frame_type == MSG_TYPE_STOP) {
-            printf("Stop frame received after %u polls. Exiting.\n", poll_count);
-            fflush(stdout);
+            LOG_INFO("Stop frame received after %u polls. Exiting.\n", poll_count);
             break;
         }
 
@@ -619,8 +648,7 @@ static int run_responder(uint32_t expected_polls) {
         ppm_on_poll = read_ppm_from_carrier_integrator_ch9();
 
         if (!first_poll_received) {
-            printf("Polling received. Measurement started.\n");
-            fflush(stdout);
+            LOG_INFO("Polling received. Measurement started.\n");
             first_poll_received = true;
         }
 
@@ -629,11 +657,10 @@ static int run_responder(uint32_t expected_polls) {
         /* Log progress every 10 polls */
         if (poll_count % 10 == 0) {
             if (expected_polls > 0) {
-                printf("Polls received: %u/%u\n", poll_count, expected_polls);
+                LOG_INFO("Polls received: %u/%u\n", poll_count, expected_polls);
             } else {
-                printf("Polls received: %u\n", poll_count);
+                LOG_INFO("Polls received: %u\n", poll_count);
             }
-            fflush(stdout);
         }
 
         /* [2] Send RESPONSE, auto-enable RX for Final */
@@ -745,8 +772,7 @@ static int run_responder(uint32_t expected_polls) {
         
         /* Exit if we've completed expected number of polls */
         if (expected_polls > 0 && poll_count >= expected_polls) {
-            printf("Measurement complete. Completed all %u expected polls.\n", poll_count);
-            fflush(stdout);
+            LOG_INFO("Measurement complete. Completed all %u expected polls.\n", poll_count);
             break;
         }
     }
@@ -759,15 +785,16 @@ static int run_responder(uint32_t expected_polls) {
  *============================================================================*/
 
 static void init_frames(role_t role) {
-    uint16_t my_addr = (role == ROLE_RESPONDER) ? g_responder_id : g_initiator_id;
-    uint16_t peer_addr = (role == ROLE_RESPONDER) ? g_initiator_id : g_responder_id;
+    (void)role;
+    uint16_t my_addr = g_service_cfg.local_id;
+    uint16_t peer_addr = g_service_cfg.peer_id;
 
     /* POLL frame: initiator -> responder */
     g_poll_frame[0] = 0x41;
     g_poll_frame[1] = 0x88;
     g_poll_frame[2] = 0x00;  /* Seq (will be set per transmission) */
-    g_poll_frame[3] = (PAN_ID & 0xFF);
-    g_poll_frame[4] = (PAN_ID >> 8);
+    g_poll_frame[3] = (uint8_t)(g_service_cfg.pan_id & 0xFF);
+    g_poll_frame[4] = (uint8_t)(g_service_cfg.pan_id >> 8);
     g_poll_frame[5] = (peer_addr & 0xFF);
     g_poll_frame[6] = (peer_addr >> 8);
     g_poll_frame[7] = (my_addr & 0xFF);
@@ -778,8 +805,8 @@ static void init_frames(role_t role) {
     g_response_frame[0] = 0x41;
     g_response_frame[1] = 0x88;
     g_response_frame[2] = 0x00;  /* Seq (will be copied from poll) */
-    g_response_frame[3] = (PAN_ID & 0xFF);
-    g_response_frame[4] = (PAN_ID >> 8);
+    g_response_frame[3] = (uint8_t)(g_service_cfg.pan_id & 0xFF);
+    g_response_frame[4] = (uint8_t)(g_service_cfg.pan_id >> 8);
     g_response_frame[5] = (peer_addr & 0xFF);
     g_response_frame[6] = (peer_addr >> 8);
     g_response_frame[7] = (my_addr & 0xFF);
@@ -790,8 +817,8 @@ static void init_frames(role_t role) {
     g_final_frame[0] = 0x41;
     g_final_frame[1] = 0x88;
     g_final_frame[2] = 0x00;  /* Seq (will be set per transmission) */
-    g_final_frame[3] = (PAN_ID & 0xFF);
-    g_final_frame[4] = (PAN_ID >> 8);
+    g_final_frame[3] = (uint8_t)(g_service_cfg.pan_id & 0xFF);
+    g_final_frame[4] = (uint8_t)(g_service_cfg.pan_id >> 8);
     g_final_frame[5] = (peer_addr & 0xFF);
     g_final_frame[6] = (peer_addr >> 8);
     g_final_frame[7] = (my_addr & 0xFF);
@@ -802,8 +829,8 @@ static void init_frames(role_t role) {
     g_report_frame[0] = 0x41;
     g_report_frame[1] = 0x88;
     g_report_frame[2] = 0x00;  /* Seq (will be set per transmission) */
-    g_report_frame[3] = (PAN_ID & 0xFF);
-    g_report_frame[4] = (PAN_ID >> 8);
+    g_report_frame[3] = (uint8_t)(g_service_cfg.pan_id & 0xFF);
+    g_report_frame[4] = (uint8_t)(g_service_cfg.pan_id >> 8);
     g_report_frame[5] = (peer_addr & 0xFF);
     g_report_frame[6] = (peer_addr >> 8);
     g_report_frame[7] = (my_addr & 0xFF);
@@ -815,8 +842,8 @@ static void init_frames(role_t role) {
     g_result_frame[0] = 0x41;
     g_result_frame[1] = 0x88;
     g_result_frame[2] = 0x00;  /* Seq (will be set per transmission) */
-    g_result_frame[3] = (PAN_ID & 0xFF);
-    g_result_frame[4] = (PAN_ID >> 8);
+    g_result_frame[3] = (uint8_t)(g_service_cfg.pan_id & 0xFF);
+    g_result_frame[4] = (uint8_t)(g_service_cfg.pan_id >> 8);
     g_result_frame[5] = (peer_addr & 0xFF);
     g_result_frame[6] = (peer_addr >> 8);
     g_result_frame[7] = (my_addr & 0xFF);
@@ -828,8 +855,8 @@ static void init_frames(role_t role) {
     g_stop_frame[0] = 0x41;
     g_stop_frame[1] = 0x88;
     g_stop_frame[2] = 0x00;  /* Seq (will be set per transmission) */
-    g_stop_frame[3] = (PAN_ID & 0xFF);
-    g_stop_frame[4] = (PAN_ID >> 8);
+    g_stop_frame[3] = (uint8_t)(g_service_cfg.pan_id & 0xFF);
+    g_stop_frame[4] = (uint8_t)(g_service_cfg.pan_id >> 8);
     g_stop_frame[5] = (peer_addr & 0xFF);
     g_stop_frame[6] = (peer_addr >> 8);
     g_stop_frame[7] = (my_addr & 0xFF);
@@ -838,81 +865,10 @@ static void init_frames(role_t role) {
 }
 
 static void configure_device(role_t role) {
-    uint16_t addr = (role == ROLE_RESPONDER) ? g_responder_id : g_initiator_id;
+    (void)role;
+    uint16_t addr = g_service_cfg.local_id;
     dwt_setaddress16(addr);
-    dwt_setpanid(PAN_ID);
-    dwt_setrxantennadelay(g_ant_dly);
-    dwt_settxantennadelay(g_ant_dly);
+    dwt_setpanid(g_service_cfg.pan_id);
+    dwt_setrxantennadelay(g_service_cfg.antenna_delay);
+    dwt_settxantennadelay(g_service_cfg.antenna_delay);
 }
-
-static void print_usage(const char *prog) {
-    fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  %s initiator <initiator_id> <responder_id> <num_measurements>\n", prog);
-    fprintf(stderr, "  %s responder <responder_id> <initiator_id> [expected_polls]\n", prog);
-    fprintf(stderr, "\n");
-    fprintf(stderr, "IDs are 16-bit addresses (0x0001 to 0xFFFF)\n");
-    fprintf(stderr, "expected_polls: optional, exits after N polls (default: waits for 15s timeout)\n");
-    fprintf(stderr, "Output format (initiator): mean,stddev,min,max,median,success_count,total_count\n");
-}
-
-int main(int argc, char **argv) {
-    if (argc < 3) {
-        print_usage(argv[0]);
-        return 1;
-    }
-
-    role_t role;
-    if (strcmp(argv[1], "initiator") == 0) {
-        role = ROLE_INITIATOR;
-        if (argc != 5) {
-            print_usage(argv[0]);
-            return 1;
-        }
-        g_initiator_id = (uint16_t)strtoul(argv[2], NULL, 0);
-        g_responder_id = (uint16_t)strtoul(argv[3], NULL, 0);
-    } else if (strcmp(argv[1], "responder") == 0) {
-        role = ROLE_RESPONDER;
-        if (argc != 4 && argc != 5) {
-            print_usage(argv[0]);
-            return 1;
-        }
-        g_responder_id = (uint16_t)strtoul(argv[2], NULL, 0);
-        g_initiator_id = (uint16_t)strtoul(argv[3], NULL, 0);
-    } else {
-        print_usage(argv[0]);
-        return 1;
-    }
-
-    if (chip_init() != 0) {
-        fprintf(stderr, "ERROR: chip initialization failed\n");
-        return 1;
-    }
-
-    configure_device(role);
-    init_frames(role);
-
-    int result;
-    if (role == ROLE_INITIATOR) {
-        uint32_t num_measurements = (uint32_t)strtoul(argv[4], NULL, 0);
-        if (num_measurements == 0 || num_measurements > 1000) {
-            fprintf(stderr, "ERROR: num_measurements must be 1-1000\n");
-            result = 1;
-        } else {
-            result = run_initiator(num_measurements);
-        }
-    } else {
-        uint32_t expected_polls = 0;
-        if (argc >= 5) {
-            expected_polls = (uint32_t)strtoul(argv[4], NULL, 0);
-            if (expected_polls > 1000) {
-                fprintf(stderr, "ERROR: expected_polls must be 0-1000\n");
-                return 1;
-            }
-        }
-        result = run_responder(expected_polls);
-    }
-
-    chip_shutdown();
-    return result;
-}
-

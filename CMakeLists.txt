@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 project(dw3k_daemon C)
 
+include(GNUInstallDirs)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -17,6 +19,7 @@ add_library(dw3k_core
     src/init.c
     src/qorvo_wrapper.c
     src/spi_driver.c
+    src/twr_service.c
 )
 
 target_include_directories(dw3k_core
@@ -29,20 +32,23 @@ target_include_directories(dw3k_core
 target_link_libraries(dw3k_core
     PUBLIC
         uwb_driver
+        m
 )
 
-add_executable(test_init src/test_init.c)
-target_link_libraries(test_init PRIVATE dw3k_core)
+add_executable(dw3k_daemon
+    src/dw3k_daemon.c
+)
+target_link_libraries(dw3k_daemon
+    PRIVATE
+        dw3k_core
+        pthread
+)
 
-add_executable(test_scan src/test_scan.c)
-target_link_libraries(test_scan PRIVATE dw3k_core)
+install(TARGETS dw3k_daemon
+    RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR}
+)
 
-add_executable(test_beacon src/test_beacon.c)
-target_link_libraries(test_beacon PRIVATE dw3k_core)
-
-add_executable(test_twr src/test_twr.c)
-target_link_libraries(test_twr PRIVATE dw3k_core m)  # 'm' for math library (sqrt)
-
-add_executable(twr_measure src/twr_measure.c)
-target_link_libraries(twr_measure PRIVATE dw3k_core m)  # 'm' for math library (sqrt)
+install(FILES config/dw3k-daemon.conf
+    DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}
+)
 
