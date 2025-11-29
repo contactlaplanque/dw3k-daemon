@@ -91,6 +91,9 @@ Each request is a single JSON object terminated by EOF; the daemon replies with
   - `count` is optional; if provided (or `expected_polls`) it limits how many
     polls to serve before exiting.
   - The response simply acknowledges completion.
+- After each run the daemon automatically reinitializes the DW3K so the next
+  measurement starts from a clean hardware state. If re-initialization fails
+  you’ll get an error telling you to reissue `chip_enable`.
 
 ### Python Helper
 

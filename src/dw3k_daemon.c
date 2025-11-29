@@ -458,16 +458,26 @@ static int perform_measurement(daemon_state_t *state, twr_role_t role, uint32_t 
     } else {
         rc = twr_service_run_initiator(count, stats);
     }
+    int restart_rc = restart_chip_locked(state, role);
     pthread_mutex_unlock(&state->hw_mutex);
 
     pthread_mutex_lock(&state->lock);
     state->hw_busy = false;
-    if (role == TWR_ROLE_INITIATOR && rc == 0 && stats) {
+    if (restart_rc != 0) {
+        state->chip_active = false;
+        state->last_health_ok = false;
+        snprintf(state->last_health_msg, sizeof(state->last_health_msg), "restart failed");
+    } else if (role == TWR_ROLE_INITIATOR && rc == 0 && stats) {
         state->last_stats = *stats;
         state->have_last_stats = true;
         state->last_measurement_time = time(NULL);
     }
     pthread_mutex_unlock(&state->lock);
+
+    if (restart_rc != 0) {
+        stop_monitor_thread(state);
+        return -3;
+    }
     return rc;
 }
 
@@ -596,6 +606,16 @@ static void send_status(int fd, daemon_state_t *state) {
     }
 }
 
+static int restart_chip_locked(daemon_state_t *state, twr_role_t role) {
+    chip_shutdown();
+    if (chip_init() != 0) {
+        return -1;
+    }
+    apply_config_locked(state);
+    twr_service_prepare_frames(role);
+    return 0;
+}
+
 static void handle_twr_request(int fd, const char *req, daemon_state_t *state) {
     uint32_t peer_id = 0;
     if (!json_get_uint(req, "peer_id", &peer_id)) {
@@ -662,6 +682,9 @@ static void handle_twr_request(int fd, const char *req, daemon_state_t *state) {
         return;
     } else if (rc == -2) {
         respond_error(fd, "busy");
+        return;
+    } else if (rc == -3) {
+        respond_error(fd, "chip restart failed - re-run chip_enable");
         return;
     } else if (rc != 0) {
         respond_error(fd, "measurement failed");
