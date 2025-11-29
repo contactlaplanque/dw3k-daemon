@@ -59,7 +59,7 @@
 #define TX_TO_TX_DELAY_US       3000U
 #define MAX_STAGE_RETRIES       2U
 #define MAX_WAIT_RETRIES        2U
-#define FAST_RANGING_INTERVAL_US 80000U  /* 80ms between measurements - safe for reliability */
+#define FAST_RANGING_INTERVAL_US 50000U  /* 50ms between measurements - balanced speed/reliability */
 #define RESPONDER_IDLE_TIMEOUT_UUS 15000000U  /* 15s timeout after polling starts */
 #define DEFAULT_WAIT_TIMEOUT_US (RX_TIMEOUT_UUS * 3U)  /* ~90ms */
 
@@ -435,8 +435,12 @@ static int run_initiator(uint32_t num_measurements) {
  * DS-TWR Responder
  *============================================================================*/
 
-static int run_responder(void) {
-    printf("Waiting for polls...\n");
+static int run_responder(uint32_t expected_polls) {
+    if (expected_polls > 0) {
+        printf("Waiting for %u polls...\n", expected_polls);
+    } else {
+        printf("Waiting for polls...\n");
+    }
     fflush(stdout);
     
     filter_t filter;
@@ -491,10 +495,14 @@ static int run_responder(void) {
         }
 
         poll_count++;
-
+        
         /* Log progress every 10 polls */
         if (poll_count % 10 == 0) {
-            printf("Polls received: %u\n", poll_count);
+            if (expected_polls > 0) {
+                printf("Polls received: %u/%u\n", poll_count, expected_polls);
+            } else {
+                printf("Polls received: %u\n", poll_count);
+            }
             fflush(stdout);
         }
 
@@ -579,6 +587,13 @@ static int run_responder(void) {
 
         dwt_forcetrxoff();
         send_frame(g_result_frame, RESULT_FRAME_LEN, NULL, false);
+        
+        /* Exit if we've completed expected number of polls */
+        if (expected_polls > 0 && poll_count >= expected_polls) {
+            printf("Measurement complete. Completed all %u expected polls.\n", poll_count);
+            fflush(stdout);
+            break;
+        }
     }
 
     return 0;
@@ -678,9 +693,10 @@ static void configure_device(role_t role) {
 static void print_usage(const char *prog) {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s initiator <initiator_id> <responder_id> <num_measurements>\n", prog);
-    fprintf(stderr, "  %s responder <responder_id> <initiator_id>\n", prog);
+    fprintf(stderr, "  %s responder <responder_id> <initiator_id> [expected_polls]\n", prog);
     fprintf(stderr, "\n");
     fprintf(stderr, "IDs are 16-bit addresses (0x0001 to 0xFFFF)\n");
+    fprintf(stderr, "expected_polls: optional, exits after N polls (default: waits for 15s timeout)\n");
     fprintf(stderr, "Output format (initiator): mean,stddev,min,max,median,success_count,total_count\n");
 }
 
@@ -701,7 +717,7 @@ int main(int argc, char **argv) {
         g_responder_id = (uint16_t)strtoul(argv[3], NULL, 0);
     } else if (strcmp(argv[1], "responder") == 0) {
         role = ROLE_RESPONDER;
-        if (argc != 4) {
+        if (argc != 4 && argc != 5) {
             print_usage(argv[0]);
             return 1;
         }
@@ -730,7 +746,15 @@ int main(int argc, char **argv) {
             result = run_initiator(num_measurements);
         }
     } else {
-        result = run_responder();
+        uint32_t expected_polls = 0;
+        if (argc >= 5) {
+            expected_polls = (uint32_t)strtoul(argv[4], NULL, 0);
+            if (expected_polls > 1000) {
+                fprintf(stderr, "ERROR: expected_polls must be 0-1000\n");
+                return 1;
+            }
+        }
+        result = run_responder(expected_polls);
     }
 
     chip_shutdown();
