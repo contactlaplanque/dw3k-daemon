@@ -55,6 +55,7 @@ typedef struct {
 
 static volatile sig_atomic_t g_should_terminate = 0;
 static bool g_foreground_mode = false;
+static int restart_chip_locked(daemon_state_t *state, twr_role_t role);
 
 static void log_message(int priority, const char *fmt, ...) {
     va_list args;
