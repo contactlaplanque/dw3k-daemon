@@ -78,8 +78,8 @@
 #define RESULT_FRAME_LEN    18U   /* Poll + distance(4) + status(1) + count(1) + reserved(2) */
 
 /* Timing */
-#define RX_TIMEOUT_UUS          10000U  /* RX timeout (μs) */
-#define TX_TO_TX_DELAY_US       1000U   /* Delay between consecutive TX (μs) */
+#define RX_TIMEOUT_UUS          15000U  /* RX timeout (μs) */
+#define TX_TO_TX_DELAY_US       2000U   /* Delay between consecutive TX (μs) */
 #define RANGING_INTERVAL_MS     500U    /* Time between ranging exchanges */
 
 /* Physics */
@@ -112,6 +112,8 @@ typedef struct {
     size_t count;
     size_t index;
     double sum;
+    double min;
+    double max;
 } filter_t;
 
 typedef struct {
@@ -230,6 +232,8 @@ static int32_t bytes_to_int32(const uint8_t *bytes) {
 
 static void filter_reset(filter_t *f) {
     memset(f, 0, sizeof(*f));
+    f->min = 1e9;
+    f->max = -1e9;
 }
 
 static void filter_add(filter_t *f, double sample) {
@@ -243,6 +247,8 @@ static void filter_add(filter_t *f, double sample) {
         f->sum += sample;
         f->index = (f->index + 1) % FILTER_WINDOW_SIZE;
     }
+    if (sample < f->min) f->min = sample;
+    if (sample > f->max) f->max = sample;
 }
 
 static double filter_mean(const filter_t *f) {
@@ -253,9 +259,27 @@ static size_t filter_count(const filter_t *f) {
     return f->count;
 }
 
+static double filter_stddev(const filter_t *f) {
+    if (f->count < 2) return 0.0;
+    double mean = filter_mean(f);
+    double variance = 0.0;
+    size_t n = (f->count < FILTER_WINDOW_SIZE) ? f->count : FILTER_WINDOW_SIZE;
+    for (size_t i = 0; i < n; i++) {
+        double diff = f->samples[i] - mean;
+        variance += diff * diff;
+    }
+    return sqrt(variance / (double)n);
+}
+
 static bool filter_is_outlier(const filter_t *f, double sample) {
     if (f->count < FILTER_WARMUP_COUNT) return false;
     return fabs(sample - filter_mean(f)) > OUTLIER_THRESHOLD_M;
+}
+
+static void filter_print_stats(const filter_t *f) {
+    if (f->count < 2) return;
+    printf("  Stats: mean=%.3f m | std=%.3f m | range=[%.3f, %.3f] m\n",
+           filter_mean(f), filter_stddev(f), f->min, f->max);
 }
 
 /*============================================================================
@@ -404,6 +428,7 @@ static void run_initiator(void) {
                 printf("  T1=0x%010" PRIX64 " T4=0x%010" PRIX64 " T5=0x%010" PRIX64 "\n", t1, t4, t5);
                 printf("  >>> DISTANCE: %.3f m <<<\n", distance);
                 printf("  Filtered avg (n=%zu): %.3f m\n", filter_count(&filter), filter_mean(&filter));
+                filter_print_stats(&filter);
             }
         }
 
@@ -420,7 +445,8 @@ exchange_failed:
     printf("Exchanges: %u | Successful: %u (%.1f%%)\n", exchange_count, success_count,
            exchange_count > 0 ? 100.0 * success_count / exchange_count : 0.0);
     if (filter_count(&filter) > 0) {
-        printf("Final filtered average: %.3f m (n=%zu)\n", filter_mean(&filter), filter_count(&filter));
+        printf("Final: mean=%.3f m | std=%.3f m | range=[%.3f, %.3f] m (n=%zu)\n",
+               filter_mean(&filter), filter_stddev(&filter), filter.min, filter.max, filter_count(&filter));
     }
 }
 
@@ -519,6 +545,7 @@ static void run_responder(void) {
                 success_count++;
                 printf("  >>> DISTANCE: %.3f m <<<\n", distance);
                 printf("  Filtered avg (n=%zu): %.3f m\n", filter_count(&filter), filter_mean(&filter));
+                filter_print_stats(&filter);
             }
         } else {
             printf("  [FAIL] Invalid calculation\n");
@@ -539,9 +566,11 @@ static void run_responder(void) {
     }
 
     printf("\n=== Summary ===\n");
-    printf("Polls: %u | Successful: %u\n", poll_count, success_count);
+    printf("Polls: %u | Successful: %u (%.1f%%)\n", poll_count, success_count,
+           poll_count > 0 ? 100.0 * success_count / poll_count : 0.0);
     if (filter_count(&filter) > 0) {
-        printf("Final filtered average: %.3f m (n=%zu)\n", filter_mean(&filter), filter_count(&filter));
+        printf("Final: mean=%.3f m | std=%.3f m | range=[%.3f, %.3f] m (n=%zu)\n",
+               filter_mean(&filter), filter_stddev(&filter), filter.min, filter.max, filter_count(&filter));
     }
 }
 
