@@ -71,9 +71,9 @@
 #define DEFAULT_ANT_DLY     16388U
 
 /* Filtering */
-#define FILTER_WINDOW_SIZE      16U
-#define FILTER_WARMUP_COUNT      4U
-#define OUTLIER_THRESHOLD_M    0.30
+#define FILTER_WINDOW_SIZE      100U  /* Hold all samples from a full measurement */
+#define FILTER_WARMUP_COUNT      10U  /* Need more samples before rejecting outliers */
+#define OUTLIER_THRESHOLD_M    0.50   /* More lenient threshold to avoid locking onto noise */
 
 /* RX buffer */
 #define RX_BUFFER_LEN       128U
@@ -311,6 +311,10 @@ static int run_initiator(uint32_t num_measurements) {
     filter_reset(&filter);
     uint32_t exchange_count = 0;
     uint32_t success_count = 0;
+    
+    /* Collect all raw successful measurements for analysis */
+    double *raw_distances = malloc(num_measurements * sizeof(double));
+    uint32_t raw_count = 0;
 
     while (exchange_count < num_measurements) {
         exchange_count++;
@@ -394,9 +398,14 @@ static int run_initiator(uint32_t num_measurements) {
         uint8_t status = g_rx_buffer[FRAME_DATA_OFFSET + 4];
 
         if (status == RESULT_STATUS_OK) {
+            success_count++;
+            /* Store raw distance */
+            if (raw_count < num_measurements) {
+                raw_distances[raw_count++] = distance;
+            }
+            /* Apply filter */
             if (!filter_is_outlier(&filter, distance)) {
                 filter_add(&filter, distance);
-                success_count++;
             }
         }
 
@@ -409,24 +418,50 @@ static int run_initiator(uint32_t num_measurements) {
     /* Notify responder that measurements are complete */
     send_stop_signal();
 
-    /* Output results */
-    if (filter_count(&filter) > 0) {
-        size_t filtered = filter_count(&filter);
-        printf("Completed %u attempts. Raw successes: %u. Filtered samples kept: %zu.\n",
-               exchange_count, success_count, filtered);
-        printf("Stats -> mean: %.3f m | stddev: %.3f m | min: %.3f m | max: %.3f m\n",
-               filter_mean(&filter), filter_stddev(&filter), filter.min, filter.max);
-        printf("%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u\n",
+    /* Calculate raw stats */
+    double raw_mean = 0.0, raw_min = 1e9, raw_max = -1e9;
+    if (raw_count > 0) {
+        for (uint32_t i = 0; i < raw_count; i++) {
+            raw_mean += raw_distances[i];
+            if (raw_distances[i] < raw_min) raw_min = raw_distances[i];
+            if (raw_distances[i] > raw_max) raw_max = raw_distances[i];
+        }
+        raw_mean /= (double)raw_count;
+        
+        double raw_variance = 0.0;
+        for (uint32_t i = 0; i < raw_count; i++) {
+            double diff = raw_distances[i] - raw_mean;
+            raw_variance += diff * diff;
+        }
+        double raw_stddev = sqrt(raw_variance / (double)raw_count);
+        
+        printf("\n=== RAW MEASUREMENTS (all successful) ===\n");
+        printf("Count: %u | Mean: %.3f m | Stddev: %.3f m | Range: [%.3f, %.3f] m\n",
+               raw_count, raw_mean, raw_stddev, raw_min, raw_max);
+        
+        printf("\n=== FILTERED MEASUREMENTS (outliers removed) ===\n");
+        printf("Count: %zu | Mean: %.3f m | Stddev: %.3f m | Range: [%.3f, %.3f] m\n",
+               filter_count(&filter), filter_mean(&filter), filter_stddev(&filter), 
+               filter.min, filter.max);
+        
+        printf("\nCompleted %u attempts. Raw successes: %u. Filtered samples: %zu. Rejected: %u\n",
+               exchange_count, success_count, filter_count(&filter), raw_count - (uint32_t)filter_count(&filter));
+        
+        /* CSV output uses filtered stats */
+        printf("\nCSV: %.3f,%.3f,%.3f,%.3f,%.3f,%zu,%u\n",
                filter_mean(&filter),
                filter_stddev(&filter),
                filter.min,
                filter.max,
-               filter_mean(&filter),  /* median approximation (using mean) */
-               (uint32_t)filtered,
+               filter_mean(&filter),
+               filter_count(&filter),
                exchange_count);
+        
+        free(raw_distances);
         return 0;
     } else {
         fprintf(stderr, "ERROR: No successful measurements\n");
+        free(raw_distances);
         return 1;
     }
 }
