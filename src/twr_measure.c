@@ -70,10 +70,9 @@
 /* Default antenna delay (DWT units) */
 #define DEFAULT_ANT_DLY     16388U
 
-/* Filtering */
-#define FILTER_WINDOW_SIZE      100U  /* Hold all samples from a full measurement */
-#define FILTER_WARMUP_COUNT      10U  /* Need more samples before rejecting outliers */
-#define OUTLIER_THRESHOLD_M    0.50   /* More lenient threshold to avoid locking onto noise */
+/* Filtering - use dynamic allocation to handle any measurement count */
+#define MAX_MEASUREMENTS        1000U  /* Maximum samples we can handle */
+#define OUTLIER_THRESHOLD_SIGMA  3.0   /* Reject samples beyond 3 sigma (99.7% confidence) */
 
 /* RX buffer */
 #define RX_BUFFER_LEN       128U
@@ -87,14 +86,12 @@ typedef enum {
     ROLE_RESPONDER
 } role_t;
 
+/* Simple container for raw measurements - filtering done separately */
 typedef struct {
-    double samples[FILTER_WINDOW_SIZE];
+    double *samples;
     size_t count;
-    size_t index;
-    double sum;
-    double min;
-    double max;
-} filter_t;
+    size_t capacity;
+} measurement_buffer_t;
 
 /*============================================================================
  * Global State
@@ -156,53 +153,97 @@ static int32_t bytes_to_int32(const uint8_t *bytes) {
 }
 
 /*============================================================================
- * Filter Functions
+ * Robust Statistical Filtering
  *============================================================================*/
 
-static void filter_reset(filter_t *f) {
-    memset(f, 0, sizeof(*f));
-    f->min = 1e9;
-    f->max = -1e9;
+/* Comparison function for qsort */
+static int compare_doubles(const void *a, const void *b) {
+    double diff = *(const double *)a - *(const double *)b;
+    return (diff > 0) - (diff < 0);
 }
 
-static void filter_add(filter_t *f, double sample) {
-    if (f->count < FILTER_WINDOW_SIZE) {
-        f->samples[f->count] = sample;
-        f->sum += sample;
-        f->count++;
+/* Calculate median of array */
+static double calculate_median(const double *data, size_t count) {
+    if (count == 0) return 0.0;
+    if (count == 1) return data[0];
+    
+    /* Create sorted copy */
+    double *sorted = malloc(count * sizeof(double));
+    memcpy(sorted, data, count * sizeof(double));
+    qsort(sorted, count, sizeof(double), compare_doubles);
+    
+    double median;
+    if (count % 2 == 0) {
+        median = (sorted[count/2 - 1] + sorted[count/2]) / 2.0;
     } else {
-        f->sum -= f->samples[f->index];
-        f->samples[f->index] = sample;
-        f->sum += sample;
-        f->index = (f->index + 1) % FILTER_WINDOW_SIZE;
+        median = sorted[count/2];
     }
-    if (sample < f->min) f->min = sample;
-    if (sample > f->max) f->max = sample;
+    
+    free(sorted);
+    return median;
 }
 
-static double filter_mean(const filter_t *f) {
-    return (f->count > 0) ? (f->sum / (double)f->count) : 0.0;
+/* Calculate mean */
+static double calculate_mean(const double *data, size_t count) {
+    if (count == 0) return 0.0;
+    double sum = 0.0;
+    for (size_t i = 0; i < count; i++) {
+        sum += data[i];
+    }
+    return sum / (double)count;
 }
 
-static size_t filter_count(const filter_t *f) {
-    return f->count;
-}
-
-static double filter_stddev(const filter_t *f) {
-    if (f->count < 2) return 0.0;
-    double mean = filter_mean(f);
+/* Calculate standard deviation */
+static double calculate_stddev(const double *data, size_t count, double mean) {
+    if (count < 2) return 0.0;
     double variance = 0.0;
-    size_t n = (f->count < FILTER_WINDOW_SIZE) ? f->count : FILTER_WINDOW_SIZE;
-    for (size_t i = 0; i < n; i++) {
-        double diff = f->samples[i] - mean;
+    for (size_t i = 0; i < count; i++) {
+        double diff = data[i] - mean;
         variance += diff * diff;
     }
-    return sqrt(variance / (double)n);
+    return sqrt(variance / (double)count);
 }
 
-static bool filter_is_outlier(const filter_t *f, double sample) {
-    if (f->count < FILTER_WARMUP_COUNT) return false;
-    return fabs(sample - filter_mean(f)) > OUTLIER_THRESHOLD_M;
+/* Robust outlier rejection using iterative 3-sigma clipping */
+static size_t robust_filter(const double *raw_data, size_t raw_count,
+                           double *filtered_data, size_t max_filtered) {
+    if (raw_count == 0) return 0;
+    
+    /* Start with all data */
+    size_t filtered_count = (raw_count < max_filtered) ? raw_count : max_filtered;
+    memcpy(filtered_data, raw_data, filtered_count * sizeof(double));
+    
+    /* Need at least 10 samples for meaningful statistics */
+    if (raw_count < 10) return filtered_count;
+    
+    /* Iterative 3-sigma clipping (max 3 iterations) */
+    for (int iteration = 0; iteration < 3; iteration++) {
+        double mean = calculate_mean(filtered_data, filtered_count);
+        double stddev = calculate_stddev(filtered_data, filtered_count, mean);
+        
+        /* If stddev is tiny, data is very clean - stop filtering */
+        if (stddev < 0.001) break;
+        
+        double threshold = OUTLIER_THRESHOLD_SIGMA * stddev;
+        
+        /* Filter out outliers */
+        size_t new_count = 0;
+        for (size_t i = 0; i < filtered_count; i++) {
+            if (fabs(filtered_data[i] - mean) <= threshold) {
+                filtered_data[new_count++] = filtered_data[i];
+            }
+        }
+        
+        /* If no samples rejected, filtering converged */
+        if (new_count == filtered_count) break;
+        
+        filtered_count = new_count;
+        
+        /* Don't over-filter - keep at least 70% of original data */
+        if (filtered_count < (raw_count * 7 / 10)) break;
+    }
+    
+    return filtered_count;
 }
 
 /*============================================================================
@@ -307,14 +348,14 @@ static int run_initiator(uint32_t num_measurements) {
     printf("Running measurement: %u samples\n", num_measurements);
     fflush(stdout);
     
-    filter_t filter;
-    filter_reset(&filter);
     uint32_t exchange_count = 0;
     uint32_t success_count = 0;
     
-    /* Collect all raw successful measurements for analysis */
-    double *raw_distances = malloc(num_measurements * sizeof(double));
-    uint32_t raw_count = 0;
+    /* Allocate buffers for raw and filtered measurements */
+    size_t max_samples = (num_measurements < MAX_MEASUREMENTS) ? num_measurements : MAX_MEASUREMENTS;
+    double *raw_distances = malloc(max_samples * sizeof(double));
+    double *filtered_distances = malloc(max_samples * sizeof(double));
+    size_t raw_count = 0;
 
     while (exchange_count < num_measurements) {
         exchange_count++;
@@ -400,12 +441,8 @@ static int run_initiator(uint32_t num_measurements) {
         if (status == RESULT_STATUS_OK) {
             success_count++;
             /* Store raw distance */
-            if (raw_count < num_measurements) {
+            if (raw_count < max_samples) {
                 raw_distances[raw_count++] = distance;
-            }
-            /* Apply filter */
-            if (!filter_is_outlier(&filter, distance)) {
-                filter_add(&filter, distance);
             }
         }
 
@@ -418,50 +455,58 @@ static int run_initiator(uint32_t num_measurements) {
     /* Notify responder that measurements are complete */
     send_stop_signal();
 
-    /* Calculate raw stats */
-    double raw_mean = 0.0, raw_min = 1e9, raw_max = -1e9;
+    /* Process results */
     if (raw_count > 0) {
-        for (uint32_t i = 0; i < raw_count; i++) {
-            raw_mean += raw_distances[i];
+        /* Calculate raw statistics */
+        double raw_mean = calculate_mean(raw_distances, raw_count);
+        double raw_stddev = calculate_stddev(raw_distances, raw_count, raw_mean);
+        double raw_median = calculate_median(raw_distances, raw_count);
+        double raw_min = raw_distances[0], raw_max = raw_distances[0];
+        for (size_t i = 1; i < raw_count; i++) {
             if (raw_distances[i] < raw_min) raw_min = raw_distances[i];
             if (raw_distances[i] > raw_max) raw_max = raw_distances[i];
         }
-        raw_mean /= (double)raw_count;
         
-        double raw_variance = 0.0;
-        for (uint32_t i = 0; i < raw_count; i++) {
-            double diff = raw_distances[i] - raw_mean;
-            raw_variance += diff * diff;
+        /* Apply robust filtering */
+        size_t filtered_count = robust_filter(raw_distances, raw_count, filtered_distances, max_samples);
+        
+        /* Calculate filtered statistics */
+        double filt_mean = calculate_mean(filtered_distances, filtered_count);
+        double filt_stddev = calculate_stddev(filtered_distances, filtered_count, filt_mean);
+        double filt_median = calculate_median(filtered_distances, filtered_count);
+        double filt_min = filtered_distances[0], filt_max = filtered_distances[0];
+        for (size_t i = 1; i < filtered_count; i++) {
+            if (filtered_distances[i] < filt_min) filt_min = filtered_distances[i];
+            if (filtered_distances[i] > filt_max) filt_max = filtered_distances[i];
         }
-        double raw_stddev = sqrt(raw_variance / (double)raw_count);
         
         printf("\n=== RAW MEASUREMENTS (all successful) ===\n");
-        printf("Count: %u | Mean: %.3f m | Stddev: %.3f m | Range: [%.3f, %.3f] m\n",
-               raw_count, raw_mean, raw_stddev, raw_min, raw_max);
+        printf("Count: %zu | Mean: %.3f m | Median: %.3f m | Stddev: %.3f m\n",
+               raw_count, raw_mean, raw_median, raw_stddev);
+        printf("Range: [%.3f, %.3f] m\n", raw_min, raw_max);
         
-        printf("\n=== FILTERED MEASUREMENTS (outliers removed) ===\n");
-        printf("Count: %zu | Mean: %.3f m | Stddev: %.3f m | Range: [%.3f, %.3f] m\n",
-               filter_count(&filter), filter_mean(&filter), filter_stddev(&filter), 
-               filter.min, filter.max);
+        printf("\n=== FILTERED MEASUREMENTS (robust 3-sigma filtering) ===\n");
+        printf("Count: %zu | Mean: %.3f m | Median: %.3f m | Stddev: %.3f m\n",
+               filtered_count, filt_mean, filt_median, filt_stddev);
+        printf("Range: [%.3f, %.3f] m\n", filt_min, filt_max);
         
-        printf("\nCompleted %u attempts. Raw successes: %u. Filtered samples: %zu. Rejected: %u\n",
-               exchange_count, success_count, filter_count(&filter), raw_count - (uint32_t)filter_count(&filter));
+        printf("\nCompleted %u attempts. Successes: %u. Filtered: %zu. Rejected: %zu (%.1f%%)\n",
+               exchange_count, success_count, filtered_count, 
+               raw_count - filtered_count,
+               100.0 * (raw_count - filtered_count) / raw_count);
         
-        /* CSV output uses filtered stats */
+        /* CSV output: mean,stddev,min,max,median,filtered_count,total_attempts */
         printf("\nCSV: %.3f,%.3f,%.3f,%.3f,%.3f,%zu,%u\n",
-               filter_mean(&filter),
-               filter_stddev(&filter),
-               filter.min,
-               filter.max,
-               filter_mean(&filter),
-               filter_count(&filter),
-               exchange_count);
+               filt_mean, filt_stddev, filt_min, filt_max, filt_median,
+               filtered_count, exchange_count);
         
         free(raw_distances);
+        free(filtered_distances);
         return 0;
     } else {
         fprintf(stderr, "ERROR: No successful measurements\n");
         free(raw_distances);
+        free(filtered_distances);
         return 1;
     }
 }
@@ -478,8 +523,6 @@ static int run_responder(uint32_t expected_polls) {
     }
     fflush(stdout);
     
-    filter_t filter;
-    filter_reset(&filter);
     uint32_t poll_count = 0;
     bool first_poll_received = false;
 
@@ -607,18 +650,11 @@ static int run_responder(uint32_t expected_polls) {
             }
         }
 
-        /* Apply filter */
-        if (status == RESULT_STATUS_OK) {
-            if (!filter_is_outlier(&filter, distance)) {
-                filter_add(&filter, distance);
-            }
-        }
-
-        /* [5] Send RESULT */
+        /* [5] Send RESULT (responder doesn't filter - initiator does that) */
         g_result_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
         int32_to_bytes((int32_t)llround(distance * 1000.0), &g_result_frame[FRAME_DATA_OFFSET]);
         g_result_frame[FRAME_DATA_OFFSET + 4] = status;
-        g_result_frame[FRAME_DATA_OFFSET + 5] = (uint8_t)filter_count(&filter);
+        g_result_frame[FRAME_DATA_OFFSET + 5] = (uint8_t)poll_count;
 
         dwt_forcetrxoff();
         send_frame(g_result_frame, RESULT_FRAME_LEN, NULL, false);
