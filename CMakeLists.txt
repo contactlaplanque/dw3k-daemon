@@ -6,6 +6,8 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+add_compile_definitions(_DEFAULT_SOURCE)
+
 option(DWT_DW3000 "Enable DW3000 driver support" ON)
 option(DWT_DW3720 "Enable DW3720 driver support" OFF)
 
