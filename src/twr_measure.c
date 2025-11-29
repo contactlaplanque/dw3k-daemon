@@ -56,7 +56,7 @@
 
 /* Timing - conservative for stable, accurate measurements */
 #define RX_TIMEOUT_UUS          30000U  /* 30ms RX timeout - tested reliable */
-#define TX_TO_TX_DELAY_US       4000U   /* 4ms delay between Final and Report - critical for accuracy */
+#define TX_TO_TX_DELAY_US       3000U   /* 3ms delay between Final and Report - critical for accuracy */
 #define MAX_STAGE_RETRIES       2U
 #define MAX_WAIT_RETRIES        2U
 #define FAST_RANGING_INTERVAL_US 30000U  /* 30ms - allows clean hardware reset between exchanges */

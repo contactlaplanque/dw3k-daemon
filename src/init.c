@@ -90,11 +90,11 @@ int chip_init(void) {
     // 5. Configure for operation
     printf("Configuring device...\n");
     dwt_config_t config = {
-        .chan = 5,                  // Channel 5
+        .chan = 9,                  // Channel 9 (less crowded, may reduce RF interference)
         .txPreambLength = DWT_PLEN_128,
         .rxPAC = DWT_PAC8,
-        .txCode = 4,
-        .rxCode = 4,
+        .txCode = 10,               // Preamble code 10 for Channel 9
+        .rxCode = 10,               // Preamble code 10 for Channel 9
         .sfdType = DWT_SFD_IEEE_4A,
         .dataRate = DWT_BR_6M8,
         .phrMode = DWT_PHRMODE_STD,
