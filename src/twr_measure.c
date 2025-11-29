@@ -56,7 +56,7 @@
 #define TX_TO_TX_DELAY_US       3000U
 #define MAX_STAGE_RETRIES       2U
 #define MAX_WAIT_RETRIES        2U
-#define FAST_RANGING_INTERVAL_US 20000U  /* 20ms between measurements for speed */
+#define FAST_RANGING_INTERVAL_US 80000U  /* 80ms between measurements - safe for reliability */
 
 /* Physics */
 #define SPEED_OF_LIGHT_M_S  299702547.0
@@ -280,6 +280,9 @@ static void reset_rx_state(void) {
  *============================================================================*/
 
 static int run_initiator(uint32_t num_measurements) {
+    printf("Running measurement: %u samples\n", num_measurements);
+    fflush(stdout);
+    
     filter_t filter;
     filter_reset(&filter);
     uint32_t exchange_count = 0;
@@ -287,6 +290,12 @@ static int run_initiator(uint32_t num_measurements) {
 
     while (exchange_count < num_measurements) {
         exchange_count++;
+        
+        /* Log progress every 10 measurements */
+        if (exchange_count % 10 == 0 || exchange_count == 1 || exchange_count == num_measurements) {
+            printf("Progress: %u/%u (success: %u)\n", exchange_count, num_measurements, success_count);
+            fflush(stdout);
+        }
 
         uint64_t t1 = 0, t4 = 0, t5 = 0;
         const char *fail_reason = NULL;
@@ -395,6 +404,9 @@ static int run_initiator(uint32_t num_measurements) {
  *============================================================================*/
 
 static int run_responder(void) {
+    printf("Waiting for polls...\n");
+    fflush(stdout);
+    
     filter_t filter;
     filter_reset(&filter);
     uint32_t poll_count = 0;
@@ -418,13 +430,26 @@ static int run_responder(void) {
         if (!wait_for_frame(MSG_TYPE_POLL, &t2)) {
             /* Timeout after first poll means initiator is done */
             if (first_poll_received) {
+                printf("Measurement complete. Total polls: %u\n", poll_count);
+                fflush(stdout);
                 break;
             }
             continue;
         }
         
-        first_poll_received = true;
+        if (!first_poll_received) {
+            printf("Polling received. Measurement started.\n");
+            fflush(stdout);
+            first_poll_received = true;
+        }
+        
         poll_count++;
+        
+        /* Log progress every 10 polls */
+        if (poll_count % 10 == 0) {
+            printf("Polls received: %u\n", poll_count);
+            fflush(stdout);
+        }
 
         /* [2] Send RESPONSE, auto-enable RX for Final */
         g_response_frame[FRAME_SEQ_OFFSET] = g_rx_buffer[FRAME_SEQ_OFFSET];
