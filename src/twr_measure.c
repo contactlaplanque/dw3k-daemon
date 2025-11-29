@@ -54,14 +54,14 @@
 #define RESULT_FRAME_LEN    18U
 #define STOP_FRAME_LEN      10U
 
-/* Timing */
-#define RX_TIMEOUT_UUS          30000U
-#define TX_TO_TX_DELAY_US       3000U
+/* Timing - optimized for speed while maintaining reliability */
+#define RX_TIMEOUT_UUS          20000U  /* 20ms RX timeout (was 30ms) */
+#define TX_TO_TX_DELAY_US       2000U   /* 2ms delay between Final and Report (was 3ms) */
 #define MAX_STAGE_RETRIES       2U
 #define MAX_WAIT_RETRIES        2U
 #define FAST_RANGING_INTERVAL_US 30000U  /* 30ms between measurements - balanced speed/reliability */
 #define RESPONDER_IDLE_TIMEOUT_UUS 15000000U  /* 15s timeout after polling starts */
-#define DEFAULT_WAIT_TIMEOUT_US (RX_TIMEOUT_UUS * 3U)  /* ~90ms */
+#define DEFAULT_WAIT_TIMEOUT_US (RX_TIMEOUT_UUS * 2U)  /* ~40ms (was 90ms) */
 
 /* Physics */
 #define SPEED_OF_LIGHT_M_S  299702547.0
@@ -72,7 +72,7 @@
 
 /* Filtering - use dynamic allocation to handle any measurement count */
 #define MAX_MEASUREMENTS        1000U  /* Maximum samples we can handle */
-#define OUTLIER_THRESHOLD_SIGMA  3.0   /* Reject samples beyond 3 sigma (99.7% confidence) */
+#define OUTLIER_THRESHOLD_SIGMA  2.5   /* Reject samples beyond 2.5 sigma (~98.8% confidence, more aggressive) */
 
 /* RX buffer */
 #define RX_BUFFER_LEN       128U
@@ -239,8 +239,8 @@ static size_t robust_filter(const double *raw_data, size_t raw_count,
         
         filtered_count = new_count;
         
-        /* Don't over-filter - keep at least 70% of original data */
-        if (filtered_count < (raw_count * 7 / 10)) break;
+        /* Don't over-filter - keep at least 60% of original data */
+        if (filtered_count < (raw_count * 6 / 10)) break;
     }
     
     return filtered_count;
@@ -374,7 +374,7 @@ static int run_initiator(uint32_t num_measurements) {
             bool response_ok = false;
             for (uint32_t attempt = 0; attempt < MAX_STAGE_RETRIES; ++attempt) {
                 g_poll_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
-                dwt_setrxtimeout((uint32_t)(RX_TIMEOUT_UUS * 2));
+                dwt_setrxtimeout(RX_TIMEOUT_UUS);
                 if (!send_frame(g_poll_frame, POLL_FRAME_LEN, &t1, true)) {
                     fail_reason = "Poll TX failed";
                     continue;
@@ -414,7 +414,7 @@ static int run_initiator(uint32_t num_measurements) {
                 timestamp_to_bytes(t1, &g_report_frame[FRAME_DATA_OFFSET]);
                 timestamp_to_bytes(t4, &g_report_frame[FRAME_DATA_OFFSET + 5]);
                 timestamp_to_bytes(t5, &g_report_frame[FRAME_DATA_OFFSET + 10]);
-                dwt_setrxtimeout((uint32_t)(RX_TIMEOUT_UUS * 2));
+                dwt_setrxtimeout(RX_TIMEOUT_UUS);
                 if (!send_frame(g_report_frame, REPORT_FRAME_LEN, NULL, true)) {
                     fail_reason = "Report TX failed";
                     continue;
@@ -586,7 +586,7 @@ static int run_responder(uint32_t expected_polls) {
 
         /* [2] Send RESPONSE, auto-enable RX for Final */
         g_response_frame[FRAME_SEQ_OFFSET] = g_rx_buffer[FRAME_SEQ_OFFSET];
-        dwt_setrxtimeout((uint32_t)(RX_TIMEOUT_UUS * 2));
+        dwt_setrxtimeout(RX_TIMEOUT_UUS);
         if (!send_frame(g_response_frame, RESPONSE_FRAME_LEN, &t3, true)) {
             continue;
         }
@@ -606,7 +606,7 @@ static int run_responder(uint32_t expected_polls) {
 
         /* [4] Wait for REPORT - immediately re-enable RX after FINAL */
         dwt_writesysstatuslo(SYS_STATUS_ALL_RX_GOOD | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_TO);
-        dwt_setrxtimeout((uint32_t)(RX_TIMEOUT_UUS * 2));
+        dwt_setrxtimeout(RX_TIMEOUT_UUS);
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
         
         bool report_ok = false;
@@ -616,7 +616,7 @@ static int run_responder(uint32_t expected_polls) {
                 break;
             }
             dwt_forcetrxoff();
-            dwt_setrxtimeout((uint32_t)(RX_TIMEOUT_UUS * 2));
+            dwt_setrxtimeout(RX_TIMEOUT_UUS);
             dwt_rxenable(DWT_START_RX_IMMEDIATE);
         }
         if (!report_ok) {
