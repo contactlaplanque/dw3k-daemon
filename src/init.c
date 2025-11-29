@@ -90,18 +90,18 @@ int chip_init(void) {
     // 5. Configure for operation
     printf("Configuring device...\n");
     dwt_config_t config = {
-        .chan = 5,                      // Channel 5
-        .txPreambLength = DWT_PLEN_256, // Longer preamble for better SNR
-        .rxPAC = DWT_PAC16,
+        .chan = 5,                  // Channel 5
+        .txPreambLength = DWT_PLEN_128,
+        .rxPAC = DWT_PAC8,
         .txCode = 4,
         .rxCode = 4,
         .sfdType = DWT_SFD_IEEE_4A,
         .dataRate = DWT_BR_6M8,
         .phrMode = DWT_PHRMODE_STD,
         .phrRate = DWT_PHRRATE_STD,
-        .sfdTO = (uint16_t)(256 + 1 + DWT_SFD_LEN8 - 8),
-        .stsMode = DWT_STS_MODE_1,
-        .stsLength = DWT_STS_LEN_64,
+        .sfdTO = (uint16_t)(128 + 1 + DWT_SFD_LEN8 - 8),
+        .stsMode = DWT_STS_MODE_OFF,
+        .stsLength = 0,
         .pdoaMode = DWT_PDOA_M0,
     };
 
