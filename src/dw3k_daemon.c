@@ -783,6 +783,9 @@ static void handle_client_request(int fd, const char *req, daemon_state_t *state
         state->monitor_interval_ms = interval;
         pthread_mutex_unlock(&state->lock);
         respond_ok(fd, "{}");
+    } else if (strcmp(cmd, "shutdown") == 0) {
+        g_should_terminate = 1;
+        respond_ok(fd, "{\"shutting_down\":true}");
     } else if (strcmp(cmd, "twr_measure") == 0) {
         handle_twr_request(fd, req, state);
     } else if (strcmp(cmd, "get_config") == 0) {

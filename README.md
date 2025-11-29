@@ -79,6 +79,7 @@ Each request is a single JSON object terminated by EOF; the daemon replies with
 | `set_antenna_delay`    | `antenna_delay`                                                                     | Update antenna delay (DWT units).                                                                             |
 | `set_monitor_interval` | `interval_ms`                                                                       | Change monitor polling cadence.                                                                               |
 | `twr_measure`          | `peer_id`, `role` (`"initiator"`/`"responder"`), `count`, optional `expected_polls` | Run DS-TWR. Initiator role returns measurement stats; responder role blocks until requested polls/stop frame. |
+| `shutdown`             | –                                                                                   | Request a graceful daemon exit (chip shuts down, socket removed).                                             |
 
 ### `twr_measure` Details
 
@@ -107,7 +108,39 @@ print(call({"cmd": "chip_enable"}))
 print(call({"cmd": "twr_measure", "peer_id": 0x3201,
             "role": "initiator", "count": 50}))
 print(call({"cmd": "chip_disable"}))
+# Stop the daemon gracefully:
+print(call({"cmd": "shutdown"}))
 ```
+
+## Python CLI Client
+
+A ready-to-use CLI lives in `tools/dw3k_cli.py`. It only depends on the Python
+standard library, but running it inside a virtual environment keeps your SBC
+tidy.
+
+1. Install Python tooling (Debian/Ubuntu/Rocky-based SBCs):
+   ```bash
+   sudo apt-get update
+   sudo apt-get install -y python3 python3-venv
+   ```
+2. Create and activate a venv:
+   ```bash
+   python3 -m venv ~/dw3k-cli
+   source ~/dw3k-cli/bin/activate
+   python -m pip install --upgrade pip
+   ```
+   (No extra packages are required—`pip` upgrade is optional but recommended.)
+3. Run the CLI:
+   ```bash
+   cd ~/dw3k-daemon
+   python tools/dw3k_cli.py --help
+   python tools/dw3k_cli.py chip-enable
+   python tools/dw3k_cli.py twr-measure 0x3201 --count 25
+   python tools/dw3k_cli.py shutdown
+   ```
+
+The tool assumes the daemon socket is at `/var/run/dw3k-daemon.sock`; override
+with `--socket /path/to/socket` or by setting `DW3K_DAEMON_SOCKET`.
 
 ## Testing on SBCs
 
