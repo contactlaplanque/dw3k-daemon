@@ -68,7 +68,7 @@
 /* Timing */
 #define RESP_RX_TIMEOUT_UUS         10000U  /* Response RX timeout (μs) - added to reply delay */
 #define REPLY_DELAY_UUS             3000U   /* Responder reply delay (μs) - must match responder */
-#define FINAL_DELAY_UUS             2000U   /* Initiator final TX delay (μs) */
+#define FINAL_DELAY_UUS             3000U   /* Initiator final TX delay (μs) */
 #define RESULT_RX_TIMEOUT_UUS       15000U  /* Initiator wait for result (μs) */
 #define RANGING_INTERVAL_MS         500U    /* Time between ranging exchanges */
 
@@ -809,7 +809,13 @@ static void run_responder_ds(void) {
         }
 
         t3_actual = read_tx_timestamp();
+        
+        /* Check T3 drift - for diagnostics only */
+        int64_t t3_drift = (int64_t)(t3_actual - t3_target);
         printf("  T3 (Resp TX)     : 0x%010" PRIX64 "\n", t3_actual);
+        if (t3_drift < -50 || t3_drift > 50) {
+            printf("  [WARN] T3 drift: %+" PRId64 " DWT from target\n", t3_drift);
+        }
 
         /* Wait for final */
         dwt_setrxtimeout((uint32_t)((FINAL_DELAY_UUS + RESP_RX_TIMEOUT_UUS) * 1.05));
@@ -827,13 +833,23 @@ static void run_responder_ds(void) {
 
         printf("  T6 (Final RX)    : 0x%010" PRIX64 "\n", t6);
 
+        /* 
+         * Use t3_target (what we embedded in the frame) for calculation,
+         * NOT t3_actual. This ensures consistency with what the initiator
+         * received and used for its T5 scheduling.
+         */
         int64_t ra = (int64_t)(t4 - t1);
-        int64_t rb = (int64_t)(t6 - t3_actual);
+        int64_t rb = (int64_t)(t6 - t3_target);
         int64_t da = (int64_t)(t5 - t4);
-        int64_t db = (int64_t)(t3_actual - t2);
+        int64_t db = (int64_t)(t3_target - t2);
 
         printf("  Ra=%" PRId64 "  Rb=%" PRId64 "  Da=%" PRId64 "  Db=%" PRId64 "\n",
                ra, rb, da, db);
+
+        /* Sanity check: all intervals should be positive and reasonable */
+        bool valid_intervals = (ra > 0) && (rb > 0) && (da > 0) && (db > 0) &&
+                               (ra < 500000000LL) && (rb < 500000000LL) &&  /* < ~8ms */
+                               (da < 500000000LL) && (db < 500000000LL);
 
         double numerator = (double)ra * (double)rb - (double)da * (double)db;
         double denominator = (double)ra + (double)rb + (double)da + (double)db;
@@ -841,7 +857,7 @@ static void run_responder_ds(void) {
         double distance = -1.0;
         uint8_t status = RESULT_STATUS_ERROR;
 
-        if (denominator > 0.0) {
+        if (valid_intervals && denominator > 0.0 && numerator >= 0.0) {
             double tof_dtu = numerator / denominator;
             distance = tof_dtu * DWT_TIME_UNITS * SPEED_OF_LIGHT_M_S;
             if (distance >= 0.0 && distance < 200.0) {
@@ -864,7 +880,11 @@ static void run_responder_ds(void) {
                 printf("  >>> DISTANCE (DS): %.3f m <<<\n", distance);
                 printf("  Filtered avg (n=%zu): %.3f m\n", filter_n, filt_mean);
             }
-        } else if (status == RESULT_STATUS_ERROR) {
+        } else if (!valid_intervals) {
+            printf("  [FAIL] Invalid timestamp intervals (negative or too large)\n");
+        } else if (numerator < 0.0) {
+            printf("  [FAIL] Negative ToF (Ra*Rb < Da*Db) - timing error\n");
+        } else {
             printf("  [FAIL] Invalid DS computation (numerator %.3e, denominator %.3e)\n",
                    numerator, denominator);
         }
