@@ -33,6 +33,8 @@
 #define MSG_TYPE_FINAL      0x23U
 #define MSG_TYPE_REPORT     0x24U
 #define MSG_TYPE_RESULT     0x42U
+#define MSG_TYPE_STOP       0x50U
+#define MSG_TYPE_ANY        0xFFU
 
 /* Result status codes */
 #define RESULT_STATUS_OK        0x00U
@@ -50,6 +52,7 @@
 #define FINAL_FRAME_LEN     10U
 #define REPORT_FRAME_LEN    25U
 #define RESULT_FRAME_LEN    18U
+#define STOP_FRAME_LEN      10U
 
 /* Timing */
 #define RX_TIMEOUT_UUS          30000U
@@ -57,6 +60,7 @@
 #define MAX_STAGE_RETRIES       2U
 #define MAX_WAIT_RETRIES        2U
 #define FAST_RANGING_INTERVAL_US 80000U  /* 80ms between measurements - safe for reliability */
+#define RESPONDER_IDLE_TIMEOUT_UUS 15000000U  /* 15s timeout after polling starts */
 
 /* Physics */
 #define SPEED_OF_LIGHT_M_S  299702547.0
@@ -107,6 +111,7 @@ static uint8_t g_response_frame[RESPONSE_FRAME_LEN];
 static uint8_t g_final_frame[FINAL_FRAME_LEN];
 static uint8_t g_report_frame[REPORT_FRAME_LEN];
 static uint8_t g_result_frame[RESULT_FRAME_LEN];
+static uint8_t g_stop_frame[STOP_FRAME_LEN];
 
 /*============================================================================
  * Helper Functions
@@ -229,7 +234,7 @@ static bool send_frame(uint8_t *frame, size_t len, uint64_t *tx_ts, bool rx_afte
     return false;
 }
 
-static bool wait_for_frame(uint8_t expected_type, uint64_t *rx_ts) {
+static bool wait_for_frame(uint8_t expected_type, uint64_t *rx_ts, uint8_t *received_type) {
     uint32_t timeout = RX_TIMEOUT_UUS * 3;
     uint32_t elapsed = 0;
 
@@ -244,15 +249,25 @@ static bool wait_for_frame(uint8_t expected_type, uint64_t *rx_ts) {
             uint16_t len = dwt_getframelength(&rng);
             if (len > 0 && len <= RX_BUFFER_LEN) {
                 dwt_readrxdata(g_rx_buffer, len, 0);
-                
-                /* Check source address matches expected ID */
+
+                uint8_t frame_type = g_rx_buffer[FRAME_TYPE_OFFSET];
+                bool type_matches = (expected_type == MSG_TYPE_ANY) || (frame_type == expected_type);
+                if (!type_matches) {
+                    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                    continue;
+                }
+
                 uint16_t src_addr = (uint16_t)g_rx_buffer[7] | ((uint16_t)g_rx_buffer[8] << 8);
-                uint16_t expected_id = (expected_type == MSG_TYPE_POLL || 
-                                       expected_type == MSG_TYPE_FINAL || 
-                                       expected_type == MSG_TYPE_REPORT) ? 
-                                       g_initiator_id : g_responder_id;
-                
-                if (g_rx_buffer[FRAME_TYPE_OFFSET] == expected_type && src_addr == expected_id) {
+                bool from_initiator = (frame_type == MSG_TYPE_POLL ||
+                                       frame_type == MSG_TYPE_FINAL ||
+                                       frame_type == MSG_TYPE_REPORT ||
+                                       frame_type == MSG_TYPE_STOP);
+                uint16_t expected_id = from_initiator ? g_initiator_id : g_responder_id;
+
+                if (src_addr == expected_id) {
+                    if (received_type) {
+                        *received_type = frame_type;
+                    }
                     return true;
                 }
             }
@@ -273,6 +288,13 @@ static bool wait_for_frame(uint8_t expected_type, uint64_t *rx_ts) {
 static void reset_rx_state(void) {
     dwt_forcetrxoff();
     dwt_rxenable(DWT_START_RX_IMMEDIATE);
+}
+
+static void send_stop_signal(void) {
+    g_stop_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
+    if (!send_frame(g_stop_frame, STOP_FRAME_LEN, NULL, false)) {
+        fprintf(stderr, "WARN: failed to send STOP frame\n");
+    }
 }
 
 /*============================================================================
@@ -310,7 +332,7 @@ static int run_initiator(uint32_t num_measurements) {
                     fail_reason = "Poll TX failed";
                     continue;
                 }
-                if (wait_for_frame(MSG_TYPE_RESPONSE, &t4)) {
+                if (wait_for_frame(MSG_TYPE_RESPONSE, &t4, NULL)) {
                     response_ok = true;
                     break;
                 }
@@ -350,7 +372,7 @@ static int run_initiator(uint32_t num_measurements) {
                     fail_reason = "Report TX failed";
                     continue;
                 }
-                if (wait_for_frame(MSG_TYPE_RESULT, NULL)) {
+                if (wait_for_frame(MSG_TYPE_RESULT, NULL, NULL)) {
                     result_ok = true;
                     break;
                 }
@@ -382,15 +404,23 @@ static int run_initiator(uint32_t num_measurements) {
         }
     }
 
+    /* Notify responder that measurements are complete */
+    send_stop_signal();
+
     /* Output results */
     if (filter_count(&filter) > 0) {
+        size_t filtered = filter_count(&filter);
+        printf("Completed %u attempts. Raw successes: %u. Filtered samples kept: %zu.\n",
+               exchange_count, success_count, filtered);
+        printf("Stats -> mean: %.3f m | stddev: %.3f m | min: %.3f m | max: %.3f m\n",
+               filter_mean(&filter), filter_stddev(&filter), filter.min, filter.max);
         printf("%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u\n",
                filter_mean(&filter),
                filter_stddev(&filter),
                filter.min,
                filter.max,
                filter_mean(&filter),  /* median approximation (using mean) */
-               (uint32_t)filter_count(&filter),
+               (uint32_t)filtered,
                exchange_count);
         return 0;
     } else {
@@ -422,12 +452,13 @@ static int run_responder(void) {
             /* Wait indefinitely for first poll */
             dwt_setrxtimeout(0);
         } else {
-            /* After first poll, use timeout to detect when initiator is done */
-            dwt_setrxtimeout((uint32_t)(RX_TIMEOUT_UUS * 5));  /* 150ms timeout */
+            /* After first poll, use generous timeout to detect when initiator is done */
+            dwt_setrxtimeout(RESPONDER_IDLE_TIMEOUT_UUS);
         }
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
-        if (!wait_for_frame(MSG_TYPE_POLL, &t2)) {
+        uint8_t frame_type = 0;
+        if (!wait_for_frame(first_poll_received ? MSG_TYPE_ANY : MSG_TYPE_POLL, &t2, &frame_type)) {
             /* Timeout after first poll means initiator is done */
             if (first_poll_received) {
                 printf("Measurement complete. Total polls: %u\n", poll_count);
@@ -436,15 +467,26 @@ static int run_responder(void) {
             }
             continue;
         }
-        
+
+        if (frame_type == MSG_TYPE_STOP) {
+            printf("Stop frame received after %u polls. Exiting.\n", poll_count);
+            fflush(stdout);
+            break;
+        }
+
+        if (frame_type != MSG_TYPE_POLL) {
+            /* Ignore unexpected frames */
+            continue;
+        }
+
         if (!first_poll_received) {
             printf("Polling received. Measurement started.\n");
             fflush(stdout);
             first_poll_received = true;
         }
-        
+
         poll_count++;
-        
+
         /* Log progress every 10 polls */
         if (poll_count % 10 == 0) {
             printf("Polls received: %u\n", poll_count);
@@ -461,7 +503,7 @@ static int run_responder(void) {
         /* [3] Wait for FINAL with retries */
         bool final_ok = false;
         for (uint32_t attempt = 0; attempt < MAX_WAIT_RETRIES; ++attempt) {
-            if (wait_for_frame(MSG_TYPE_FINAL, &t6)) {
+            if (wait_for_frame(MSG_TYPE_FINAL, &t6, NULL)) {
                 final_ok = true;
                 break;
             }
@@ -478,7 +520,7 @@ static int run_responder(void) {
         
         bool report_ok = false;
         for (uint32_t attempt = 0; attempt < MAX_WAIT_RETRIES; ++attempt) {
-            if (wait_for_frame(MSG_TYPE_REPORT, NULL)) {
+            if (wait_for_frame(MSG_TYPE_REPORT, NULL, NULL)) {
                 report_ok = true;
                 break;
             }
@@ -606,6 +648,18 @@ static void init_frames(role_t role) {
     g_result_frame[8] = (my_addr >> 8);
     g_result_frame[9] = MSG_TYPE_RESULT;
     /* Distance, status, count will be filled in during transmission */
+
+    /* STOP frame: initiator -> responder */
+    g_stop_frame[0] = 0x41;
+    g_stop_frame[1] = 0x88;
+    g_stop_frame[2] = 0x00;  /* Seq (will be set per transmission) */
+    g_stop_frame[3] = (PAN_ID & 0xFF);
+    g_stop_frame[4] = (PAN_ID >> 8);
+    g_stop_frame[5] = (peer_addr & 0xFF);
+    g_stop_frame[6] = (peer_addr >> 8);
+    g_stop_frame[7] = (my_addr & 0xFF);
+    g_stop_frame[8] = (my_addr >> 8);
+    g_stop_frame[9] = MSG_TYPE_STOP;
 }
 
 static void configure_device(role_t role) {
