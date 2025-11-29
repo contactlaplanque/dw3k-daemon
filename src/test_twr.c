@@ -404,6 +404,7 @@ static void run_responder(void) {
      * Uses REPLY_DELAY_UUS macro defined at top of file.
      */
     const uint64_t reply_delay_dtu = (uint64_t)(REPLY_DELAY_UUS * 1e-6 / DWT_TIME_UNITS);
+    const uint64_t tx_ant_delay_dtu = g_ant_dly;
     
     printf("Reply delay: %u μs (%llu DWT units)\n\n", 
            REPLY_DELAY_UUS, 
@@ -430,9 +431,12 @@ static void run_responder(void) {
         t3_scheduled = t2 + reply_delay_dtu;
         
         /* Embed T2 and T3 in response */
+        uint64_t t3_actual_target = t3_scheduled; /* Actual air time after TX antenna delay */
+        uint64_t dx_time_target = t3_actual_target - tx_ant_delay_dtu; /* Programmed value excludes tx antenna delay */
+
         g_response_frame[FRAME_SEQ_OFFSET] = g_rx_buffer[FRAME_SEQ_OFFSET];
         timestamp_to_bytes(t2, &g_response_frame[FRAME_DATA_OFFSET]);
-        timestamp_to_bytes(t3_scheduled, &g_response_frame[FRAME_DATA_OFFSET + 5]);
+        timestamp_to_bytes(t3_actual_target, &g_response_frame[FRAME_DATA_OFFSET + 5]);
 
         /* ===== Step 3: Send response at scheduled time T3 ===== */
         dwt_forcetrxoff();
@@ -442,9 +446,10 @@ static void run_responder(void) {
         /* 
          * Set delayed TX time. 
          * The DW3000 uses bits [8:39] of the 40-bit timestamp for delayed TX.
-         * So we shift right by 8 to get the 32-bit value to write.
+         * Program DX_TIME with the desired start minus TX antenna delay so that
+         * the actual airborne timestamp matches t3_actual_target.
          */
-        uint32_t tx_time = (uint32_t)((t3_scheduled >> 8) & 0xFFFFFFFE);  /* Must be even */
+        uint32_t tx_time = (uint32_t)(((dx_time_target) >> 8) & 0xFFFFFFFE);  /* Must be even */
         dwt_setdelayedtrxtime(tx_time);
         
         int ret = dwt_starttx(DWT_START_TX_DELAYED);
@@ -471,7 +476,7 @@ static void run_responder(void) {
                        db, db * DWT_TIME_UNITS * 1e6);
                 
                 /* Check if actual matches scheduled (within 1 DWT unit = ~15ps) */
-                int64_t diff = (int64_t)(actual_t3 - t3_scheduled);
+                int64_t diff = (int64_t)(actual_t3 - t3_actual_target);
                 if (diff < -10 || diff > 10) {
                     printf("  [WARN] T3 drift: %+" PRId64 " DWT from scheduled\n", diff);
                 }
