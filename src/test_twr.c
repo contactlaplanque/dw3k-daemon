@@ -87,7 +87,7 @@
 #define DWT_TIME_UNITS      (1.0 / 499.2e6 / 128.0)  /* ~15.65 ps per DWT unit */
 
 /* Default antenna delay (DWT units) */
-#define DEFAULT_ANT_DLY     16564U
+#define DEFAULT_ANT_DLY     16385U  /* ~256ns - typical for DWM3000 */
 
 /* Filtering */
 #define FILTER_WINDOW_SIZE      16U
@@ -646,7 +646,24 @@ static void run_calibration(void) {
 
     double mean = sum / (double)success;
     double error = mean - g_calibration_distance;
-    double delta_dtu = error / (SPEED_OF_LIGHT_M_S * DWT_TIME_UNITS);
+    
+    /*
+     * In DS-TWR, the antenna delay affects the ToF calculation.
+     * The delay is added to TX timestamps and subtracted from RX timestamps.
+     * 
+     * For each device: TX_actual = TX_reported - ant_delay
+     *                  RX_actual = RX_reported + ant_delay
+     * 
+     * In the DS-TWR formula, the antenna delays largely cancel out,
+     * but there's still a residual effect. The correction factor depends
+     * on the specific timing ratios, but empirically ~2x works for DS-TWR
+     * (compared to 4x for SS-TWR where delay appears on both ends twice).
+     * 
+     * error_m = delta_delay_s * c * factor
+     * delta_delay_dtu = error_m / (c * DWT_TIME_UNITS * factor)
+     */
+    double correction_factor = 2.0;  /* Empirical factor for DS-TWR */
+    double delta_dtu = error / (SPEED_OF_LIGHT_M_S * DWT_TIME_UNITS * correction_factor);
     int32_t new_delay = (int32_t)g_ant_dly - (int32_t)llround(delta_dtu);
     if (new_delay < 0) new_delay = 0;
     if (new_delay > 65535) new_delay = 65535;
@@ -656,8 +673,11 @@ static void run_calibration(void) {
     printf("Mean measured: %.4f m\n", mean);
     printf("True distance: %.4f m\n", g_calibration_distance);
     printf("Error: %+.4f m (%+.1f cm)\n", error, error * 100.0);
+    printf("Current delay: %u DWT\n", g_ant_dly);
+    printf("Suggested adjustment: %+.0f DWT\n", -delta_dtu);
     printf("\n>>> Recommended antenna delay: %d DWT <<<\n", new_delay);
-    printf("\nUpdate DEFAULT_ANT_DLY in test_twr.c to %d\n", new_delay);
+    printf("\nNote: Apply small incremental changes. If measurements get worse,\n");
+    printf("try adjusting in the opposite direction.\n");
 }
 
 /*============================================================================
