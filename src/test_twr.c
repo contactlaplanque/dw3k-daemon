@@ -78,8 +78,10 @@
 #define RESULT_FRAME_LEN    18U   /* Poll + distance(4) + status(1) + count(1) + reserved(2) */
 
 /* Timing */
-#define RX_TIMEOUT_UUS          20000U  /* RX timeout (μs) */
+#define RX_TIMEOUT_UUS          30000U  /* RX timeout (μs) */
 #define TX_TO_TX_DELAY_US       3000U   /* Delay between Final and Report (μs) */
+#define MAX_STAGE_RETRIES       2U      /* Retries per TX stage */
+#define MAX_WAIT_RETRIES        2U      /* Retries for passive waits */
 #define RANGING_INTERVAL_MS     500U    /* Time between ranging exchanges */
 
 /* Physics */
@@ -303,6 +305,7 @@ static bool send_frame(uint8_t *frame, size_t len, uint64_t *tx_ts, bool rx_afte
             dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
             if (tx_ts) *tx_ts = read_tx_timestamp();
             if (rx_after) {
+                dwt_forcetrxoff();
                 dwt_rxenable(DWT_START_RX_IMMEDIATE);
             }
             return true;
@@ -345,6 +348,11 @@ static bool wait_for_frame(uint8_t expected_type, uint64_t *rx_ts) {
     return false;
 }
 
+static void reset_rx_state(void) {
+    dwt_forcetrxoff();
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+}
+
 /*============================================================================
  * DS-TWR Initiator
  *============================================================================*/
@@ -364,22 +372,27 @@ static void run_initiator(void) {
         uint64_t t1 = 0, t4 = 0, t5 = 0;
         const char *fail_reason = NULL;
 
-        /* [1] Send POLL, auto-enable RX for Response */
-        g_poll_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
-        dwt_setrxtimeout((uint32_t)(RX_TIMEOUT_UUS * 2));
-        if (!send_frame(g_poll_frame, POLL_FRAME_LEN, &t1, true)) {
-            fail_reason = "Poll TX failed";
-            goto exchange_failed;
+        /* [1] Send POLL and wait for RESPONSE (with retries) */
+        {
+            bool response_ok = false;
+            for (uint32_t attempt = 0; attempt < MAX_STAGE_RETRIES; ++attempt) {
+                g_poll_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
+                dwt_setrxtimeout((uint32_t)(RX_TIMEOUT_UUS * 2));
+                if (!send_frame(g_poll_frame, POLL_FRAME_LEN, &t1, true)) {
+                    fail_reason = "Poll TX failed";
+                    continue;
+                }
+                if (wait_for_frame(MSG_TYPE_RESPONSE, &t4)) {
+                    response_ok = true;
+                    break;
+                }
+                fail_reason = "Response timeout";
+                reset_rx_state();
+            }
+            if (!response_ok) goto exchange_failed;
         }
 
-        /* [2] Wait for RESPONSE (RX already enabled) */
-        if (!wait_for_frame(MSG_TYPE_RESPONSE, &t4)) {
-            fail_reason = "Response timeout";
-            dwt_forcetrxoff();
-            goto exchange_failed;
-        }
-
-        /* [3] Send FINAL, auto-enable RX (responder needs time to process) */
+        /* [2] Send FINAL (no RX expected immediately) */
         g_final_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
         if (!send_frame(g_final_frame, FINAL_FRAME_LEN, &t5, false)) {
             fail_reason = "Final TX failed";
@@ -389,22 +402,27 @@ static void run_initiator(void) {
         /* Small delay to let responder switch to RX mode after processing Final */
         usleep(TX_TO_TX_DELAY_US);
 
-        /* [4] Send REPORT with actual T1, T4, T5, auto-enable RX for Result */
-        g_report_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
-        timestamp_to_bytes(t1, &g_report_frame[FRAME_DATA_OFFSET]);
-        timestamp_to_bytes(t4, &g_report_frame[FRAME_DATA_OFFSET + 5]);
-        timestamp_to_bytes(t5, &g_report_frame[FRAME_DATA_OFFSET + 10]);
-        dwt_setrxtimeout((uint32_t)(RX_TIMEOUT_UUS * 2));
-        if (!send_frame(g_report_frame, REPORT_FRAME_LEN, NULL, true)) {
-            fail_reason = "Report TX failed";
-            goto exchange_failed;
-        }
-
-        /* [5] Wait for RESULT (RX already enabled) */
-        if (!wait_for_frame(MSG_TYPE_RESULT, NULL)) {
-            fail_reason = "Result timeout";
-            dwt_forcetrxoff();
-            goto exchange_failed;
+        /* [3] Send REPORT and wait for RESULT (with retries) */
+        {
+            bool result_ok = false;
+            for (uint32_t attempt = 0; attempt < MAX_STAGE_RETRIES; ++attempt) {
+                g_report_frame[FRAME_SEQ_OFFSET] = g_seq_num++;
+                timestamp_to_bytes(t1, &g_report_frame[FRAME_DATA_OFFSET]);
+                timestamp_to_bytes(t4, &g_report_frame[FRAME_DATA_OFFSET + 5]);
+                timestamp_to_bytes(t5, &g_report_frame[FRAME_DATA_OFFSET + 10]);
+                dwt_setrxtimeout((uint32_t)(RX_TIMEOUT_UUS * 2));
+                if (!send_frame(g_report_frame, REPORT_FRAME_LEN, NULL, true)) {
+                    fail_reason = "Report TX failed";
+                    continue;
+                }
+                if (wait_for_frame(MSG_TYPE_RESULT, NULL)) {
+                    result_ok = true;
+                    break;
+                }
+                fail_reason = "Result timeout";
+                reset_rx_state();
+            }
+            if (!result_ok) goto exchange_failed;
         }
 
         /* Parse result */
@@ -490,19 +508,35 @@ static void run_responder(void) {
         }
         printf("  T3=0x%010" PRIX64 "\n", t3);
 
-        /* [3] Wait for FINAL (RX already enabled) */
-        if (!wait_for_frame(MSG_TYPE_FINAL, &t6)) {
+        /* [3] Wait for FINAL with retries */
+        bool final_ok = false;
+        for (uint32_t attempt = 0; attempt < MAX_WAIT_RETRIES; ++attempt) {
+            if (wait_for_frame(MSG_TYPE_FINAL, &t6)) {
+                final_ok = true;
+                break;
+            }
+            printf("  [WARN] Final timeout (attempt %u)\n", attempt + 1);
+            reset_rx_state();
+        }
+        if (!final_ok) {
             printf("  [FAIL] Final timeout\n\n");
-            dwt_forcetrxoff();
             continue;
         }
         printf("  T6=0x%010" PRIX64 "\n", t6);
 
-        /* [4] Wait for REPORT - quickly re-enable RX */
-        dwt_forcetrxoff();
-        dwt_setrxtimeout((uint32_t)(RX_TIMEOUT_UUS * 2));
-        dwt_rxenable(DWT_START_RX_IMMEDIATE);
-        if (!wait_for_frame(MSG_TYPE_REPORT, NULL)) {
+        /* [4] Wait for REPORT with retries */
+        bool report_ok = false;
+        for (uint32_t attempt = 0; attempt < MAX_WAIT_RETRIES; ++attempt) {
+            dwt_forcetrxoff();
+            dwt_setrxtimeout((uint32_t)(RX_TIMEOUT_UUS * 2));
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+            if (wait_for_frame(MSG_TYPE_REPORT, NULL)) {
+                report_ok = true;
+                break;
+            }
+            printf("  [WARN] Report timeout (attempt %u)\n", attempt + 1);
+        }
+        if (!report_ok) {
             printf("  [FAIL] Report timeout\n\n");
             dwt_forcetrxoff();
             continue;
