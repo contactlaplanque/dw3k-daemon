@@ -236,8 +236,6 @@ static role_t parse_args(int argc, char **argv) {
             fprintf(stderr, "ERROR: invalid calibration distance: %s\n", argv[2]);
             exit(1);
         }
-        /* In calibration mode, use zero antenna delay to measure raw error */
-        g_ant_dly = 0;
     } else {
         fprintf(stderr, "ERROR: unknown mode: %s\n", argv[1]);
         print_usage(argv[0]);
@@ -505,7 +503,10 @@ static void run_responder(void) {
 static void run_calibration(void) {
     printf("=== Antenna Delay Calibration ===\n");
     printf("True distance: %.3f m\n", g_calibration_distance);
-    printf("Antenna delay set to 0 for raw measurement.\n");
+    printf("Using antenna delay: %u DWT (%.2f ns)\n",
+           g_ant_dly, g_ant_dly * DWT_TIME_UNITS * 1e9);
+    printf("Make sure the responder runs with the same delay "
+           "(e.g. ./test_twr responder --antdly %u).\n", g_ant_dly);
     printf("Running 50 measurements...\n\n");
 
     stats_t cal_stats = { 0 };
@@ -568,9 +569,16 @@ static void run_calibration(void) {
      * single_device_delay = error / (2 * c) in seconds
      * In DWT units: delay_dtu = single_device_delay / DWT_TIME_UNITS
      */
-    double total_delay_s = error / SPEED_OF_LIGHT_M_S;
-    double delay_per_device_dtu = total_delay_s / DWT_TIME_UNITS / 2.0;
-    uint16_t recommended_delay = (uint16_t)fabs(delay_per_device_dtu);
+    double delta_dtu = error / (SPEED_OF_LIGHT_M_S * DWT_TIME_UNITS);
+    double recommended_delay_f = (double)g_ant_dly - delta_dtu;
+    if (recommended_delay_f < 0.0) {
+        recommended_delay_f = 0.0;
+    }
+    if (recommended_delay_f > 65535.0) {
+        recommended_delay_f = 65535.0;
+    }
+    uint16_t recommended_delay = (uint16_t)llround(recommended_delay_f);
+    int32_t delta_dly = (int32_t)recommended_delay - (int32_t)g_ant_dly;
 
     printf("\n=== Calibration Results ===\n");
     printf("Measurements: %zu\n", cal_stats.count);
@@ -579,13 +587,17 @@ static void run_calibration(void) {
     printf("Error: %+.4f m (%+.1f cm)\n", error, error * 100.0);
     
     if (error > 0) {
-        printf("\nMeasured > True: Need to ADD antenna delay compensation\n");
+        printf("\nMeasured > True: decrease antenna delay\n");
+    } else if (error < 0) {
+        printf("\nMeasured < True: increase antenna delay\n");
     } else {
-        printf("\nMeasured < True: Unusual - check setup\n");
+        printf("\nMeasured equals true distance.\n");
     }
     
-    printf("\n>>> Recommended antenna delay: %u DWT units (%.2f ns) <<<\n", 
-           recommended_delay, recommended_delay * DWT_TIME_UNITS * 1e9);
+    printf("\n>>> Recommended antenna delay: %u DWT units (%.2f ns) "
+           "[delta %+d DWT] <<<\n", 
+           recommended_delay, recommended_delay * DWT_TIME_UNITS * 1e9,
+           delta_dly);
     printf("\nAdd to your code after chip_init():\n");
     printf("  dwt_setrxantennadelay(%u);\n", recommended_delay);
     printf("  dwt_settxantennadelay(%u);\n", recommended_delay);
