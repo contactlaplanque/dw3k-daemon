@@ -37,3 +37,6 @@ target_link_libraries(test_init PRIVATE dw3k_core)
 add_executable(test_scan src/test_scan.c)
 target_link_libraries(test_scan PRIVATE dw3k_core)
 
+add_executable(test_beacon src/test_beacon.c)
+target_link_libraries(test_beacon PRIVATE dw3k_core)
+
